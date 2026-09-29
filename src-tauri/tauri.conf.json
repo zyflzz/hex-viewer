@@ -12,9 +12,11 @@
   "app": {
     "windows": [
       {
-        "title": "hex-viewer",
-        "width": 800,
-        "height": 600
+        "title": "Hex Viewer - 大文件十六进制查看器",
+        "width": 1280,
+        "height": 800,
+        "minWidth": 900,
+        "minHeight": 560
       }
     ],
     "security": {

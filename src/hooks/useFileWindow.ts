@@ -8,6 +8,8 @@ export const CHUNK_SIZE = 64 * 1024;
 const MAX_CACHED_CHUNKS = 10;
 /** 预取防抖（毫秒） */
 const PREFETCH_DELAY = 100;
+/** 分片加载失败重试次数 */
+const MAX_RETRY = 2;
 
 function toBytes(res: unknown): Uint8Array {
   if (res instanceof Uint8Array) return res;
@@ -21,6 +23,10 @@ function toBytes(res: unknown): Uint8Array {
  * - 打开文件只取元数据（mmap 建立在 Rust 侧，不读内容）
  * - 滚动时按需拉取可见区域对应的 64KB 分片，并预取邻接分片
  * - LRU 式淘汰，内存占用与文件大小无关
+ *
+ * 注意：缓存 Map 一律以"分片索引"为键（非字节偏移）。
+ * 此前键用字节偏移、淘汰中心用索引，二者混用导致淘汰排序失真，
+ * 会把当前可见的高偏移分片当作"远处"分片淘汰，造成滚动闪烁。
  */
 export function useFileWindow() {
   const [fileMeta, setFileMeta] = useState<FileMeta | null>(null);
@@ -28,6 +34,7 @@ export function useFileWindow() {
   const [cacheBytes, setCacheBytes] = useState(0);
   const [loading, setLoading] = useState(false);
 
+  // 键 = 分片索引（chunkIndex = byteOffset / CHUNK_SIZE）
   const chunksRef = useRef<Map<number, Uint8Array>>(new Map());
   const pendingRef = useRef<Set<number>>(new Set());
   const tokenRef = useRef(0);
@@ -43,6 +50,7 @@ export function useFileWindow() {
     );
   }, []);
 
+  /** 淘汰离可视中心最远的分片（键与中心同为索引，距离计算才正确） */
   const evictFarChunks = useCallback((centerChunk: number) => {
     const map = chunksRef.current;
     if (map.size <= MAX_CACHED_CHUNKS) return;
@@ -58,26 +66,33 @@ export function useFileWindow() {
   }, [bumpCache]);
 
   const fetchChunk = useCallback(
-    (chunkOffset: number, token: number) => {
+    (chunkIndex: number, token: number, attempt = 0) => {
       const map = chunksRef.current;
       const pending = pendingRef.current;
-      if (map.has(chunkOffset) || pending.has(chunkOffset)) return;
+      if (map.has(chunkIndex) || pending.has(chunkIndex)) return;
       const size = fileMetaRef.current?.size ?? 0;
+      const chunkOffset = chunkIndex * CHUNK_SIZE;
       if (chunkOffset >= size) return;
-      pending.add(chunkOffset);
+      pending.add(chunkIndex);
       setLoading(true);
       const length = Math.min(CHUNK_SIZE, size - chunkOffset);
       invoke('read_chunk', { offset: chunkOffset, length })
         .then(res => {
           if (tokenRef.current !== token) return; // 已切换文件，丢弃
-          pending.delete(chunkOffset);
-          map.set(chunkOffset, toBytes(res));
+          pending.delete(chunkIndex);
+          map.set(chunkIndex, toBytes(res));
           bumpCache();
         })
         .catch(err => {
           if (tokenRef.current !== token) return;
-          pending.delete(chunkOffset);
+          pending.delete(chunkIndex);
           console.error('读取分片失败:', err);
+          // 失败重试，避免可见区因偶发失败永远停留在占位符
+          if (attempt < MAX_RETRY) {
+            window.setTimeout(() => {
+              if (tokenRef.current === token) fetchChunk(chunkIndex, token, attempt + 1);
+            }, 150 * (attempt + 1));
+          }
         })
         .finally(() => {
           if (tokenRef.current !== token) return;
@@ -86,8 +101,6 @@ export function useFileWindow() {
     },
     [bumpCache],
   );
-
-  // fileMeta 的同步镜像见顶部声明
 
   const openFile = useCallback(async (path: string): Promise<FileMeta> => {
     const meta = await invoke<FileMeta>('open_file', { path });
@@ -103,7 +116,7 @@ export function useFileWindow() {
     // 预载开头两个分片
     const token = tokenRef.current;
     fetchChunk(0, token);
-    if (meta.size > CHUNK_SIZE) fetchChunk(CHUNK_SIZE, token);
+    if (meta.size > CHUNK_SIZE) fetchChunk(1, token);
     return meta;
   }, [fetchChunk]);
 
@@ -121,7 +134,7 @@ export function useFileWindow() {
 
       // 可见区分片：立即加载
       for (let c = firstChunk; c <= lastChunk; c++) {
-        fetchChunk(c * CHUNK_SIZE, token);
+        fetchChunk(c, token);
       }
 
       // 邻接预取：防抖，避免快速拖动滚动条时的无效 IO
@@ -135,7 +148,7 @@ export function useFileWindow() {
         const center = viewCenterChunkRef.current;
         for (const c of [center - 2, center - 1, center + 1, center + 2]) {
           if (c >= 0 && c * CHUNK_SIZE < size) {
-            fetchChunk(c * CHUNK_SIZE, cur);
+            fetchChunk(c, cur);
           }
         }
         evictFarChunks(center);
@@ -151,10 +164,10 @@ export function useFileWindow() {
   const getBytes = useCallback(
     (offset: number, len: number): Uint8Array | null => {
       const map = chunksRef.current;
-      const chunkOffset = Math.floor(offset / CHUNK_SIZE) * CHUNK_SIZE;
-      const chunk = map.get(chunkOffset);
+      const chunkIndex = Math.floor(offset / CHUNK_SIZE);
+      const chunk = map.get(chunkIndex);
       if (!chunk) return null;
-      const local = offset - chunkOffset;
+      const local = offset - chunkIndex * CHUNK_SIZE;
       const end = Math.min(local + len, chunk.length);
       if (local >= chunk.length) return null;
       return chunk.subarray(local, end);
@@ -163,7 +176,7 @@ export function useFileWindow() {
   );
 
   /**
-   * 读取任意字节范围（用于复制）：缺的分片同步补拉后拼装
+   * 读取任意字节范围（用于复制）：缺的分片补拉后拼装
    */
   const readRange = useCallback(async (offset: number, len: number): Promise<Uint8Array> => {
     const size = fileMetaRef.current?.size ?? 0;
@@ -172,11 +185,11 @@ export function useFileWindow() {
     const out = new Uint8Array(end - offset);
     const tasks: Promise<void>[] = [];
     const token = tokenRef.current;
-    let c = Math.floor(offset / CHUNK_SIZE);
+    const firstC = Math.floor(offset / CHUNK_SIZE);
     const lastC = Math.floor((end - 1) / CHUNK_SIZE);
-    for (; c <= lastC; c++) {
+    for (let c = firstC; c <= lastC; c++) {
       const chunkOffset = c * CHUNK_SIZE;
-      const chunk = chunksRef.current.get(chunkOffset);
+      const chunk = chunksRef.current.get(c);
       if (chunk) {
         const from = Math.max(offset, chunkOffset) - chunkOffset;
         const to = Math.min(end, chunkOffset + chunk.length) - chunkOffset;
@@ -187,7 +200,7 @@ export function useFileWindow() {
           invoke('read_chunk', { offset: chunkOffset, length })
             .then(res => {
               const data = toBytes(res);
-              chunksRef.current.set(chunkOffset, data);
+              chunksRef.current.set(c, data);
               const from = Math.max(offset, chunkOffset) - chunkOffset;
               const to = Math.min(end, chunkOffset + data.length) - chunkOffset;
               out.set(data.subarray(from, to), Math.max(offset, chunkOffset) - offset);

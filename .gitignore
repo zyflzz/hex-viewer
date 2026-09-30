@@ -24,3 +24,5 @@ dist-ssr
 *.sw?
 
 version_docs/*
+run.bat
+push.bat

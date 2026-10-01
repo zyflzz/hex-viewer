@@ -61,3 +61,17 @@ export interface Selection {
   start: number;
   end: number;
 }
+
+/** 书签（点，start === end）或标记（区间，start < end），按文件路径持久化 */
+export interface Bookmark {
+  id: string;
+  /** 起始偏移；点书签时 start === end */
+  start: number;
+  /** 结束偏移；点书签时 start === end */
+  end: number;
+  /** 用户命名，可为空；空名字在列表中显示偏移值 */
+  name: string;
+  /** 预设调色板颜色（#rrggbb） */
+  color: string;
+  createdAt: number;
+}

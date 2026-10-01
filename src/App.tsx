@@ -9,7 +9,8 @@ import { useFileWindow } from './hooks/useFileWindow';
 import { useFileSearch, type SearchMode } from './hooks/useFileSearch';
 import { useFileStats } from './hooks/useFileStats';
 import { usePerfMonitor } from './hooks/usePerfMonitor';
-import type { Selection, TextEncoding } from './types';
+import { useFileBookmarks } from './hooks/useFileBookmarks';
+import type { Bookmark, Selection, TextEncoding } from './types';
 import { hexByte, parseOffsetInput } from './utils/format';
 import { decodeBytesToText, encodingLabel } from './utils/decode';
 import './App.css';
@@ -53,6 +54,7 @@ function App() {
   const search = useFileSearch(fileMeta);
   const stats = useFileStats(fileMeta);
   const perf = usePerfMonitor(true);
+  const bm = useFileBookmarks(fileMeta);
 
   const hexViewerRef = useRef<HexViewerHandle>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -63,6 +65,7 @@ function App() {
   const [cursorOffset, setCursorOffset] = useState<number | null>(null);
   const [flashOffset, setFlashOffset] = useState<number | null>(null);
   const [activeHitOffset, setActiveHitOffset] = useState<number | null>(null);
+  const [activeBookmarkId, setActiveBookmarkId] = useState<string | null>(null);
   const [visibleRange, setVisibleRange] = useState<{ first: number; last: number }>({
     first: 0,
     last: 0,
@@ -99,6 +102,7 @@ function App() {
       setHoverOffset(null);
       setCursorOffset(null);
       setActiveHitOffset(null);
+      setActiveBookmarkId(null);
       setFlashOffset(null);
       const meta = await openFile(selected as string);
       // 光标初始设在偏移 0；空文件不显示光标
@@ -137,6 +141,47 @@ function App() {
     }
     jumpToOffset(parsed);
   }, [fileMeta, gotoText, jumpToOffset, showToast]);
+
+  /** 把当前选择区间转成标记 */
+  const addMarkFromSelection = useCallback(() => {
+    if (!selection) {
+      showToast('请先选择一个区间');
+      return;
+    }
+    bm.addMark(selection.start, selection.end);
+    showToast(`已标记 ${selection.end - selection.start + 1} 字节`);
+  }, [selection, bm, showToast]);
+
+  /** 跳转到书签/标记：点书签只跳转；范围标记同时选中整个区间 */
+  const jumpToBookmark = useCallback(
+    (target: Bookmark) => {
+      const size = fileMeta?.size ?? 0;
+      if (target.start >= size) {
+        showToast('偏移超出文件末尾（文件可能已被修改）');
+        return;
+      }
+      setActiveBookmarkId(target.id);
+      if (target.start !== target.end) {
+        setSelection({ start: target.start, end: Math.min(target.end, size - 1) });
+      }
+      jumpToOffset(target.start);
+    },
+    [fileMeta, jumpToOffset, showToast],
+  );
+
+  /** F2 / Shift+F2 在书签列表中循环导航 */
+  const jumpBookmarkRelative = useCallback(
+    (dir: 1 | -1) => {
+      const from = cursorOffset ?? 0;
+      const target = dir === 1 ? bm.jumpNext(from) : bm.jumpPrev(from);
+      if (!target) {
+        showToast('暂无书签');
+        return;
+      }
+      jumpToBookmark(target);
+    },
+    [cursorOffset, bm, jumpToBookmark, showToast],
+  );
 
   const handleSearch = useCallback(() => {
     search.runSearch(searchMode, searchText, caseSensitive);
@@ -212,11 +257,31 @@ function App() {
         e.preventDefault();
         // Ctrl+C 复制 Hex，Ctrl+Shift+C 按当前显示编码复制文本
         copySelection(e.shiftKey ? 'text' : 'hex');
+      } else if (ctrl && key === 'b' && !inInput) {
+        // Ctrl+B 切换光标处书签；Ctrl+Shift+B 把选择转成标记
+        e.preventDefault();
+        if (e.shiftKey) {
+          addMarkFromSelection();
+        } else if (cursorOffset !== null && fileMeta && cursorOffset < fileMeta.size) {
+          bm.toggleBookmarkAt(cursorOffset);
+        }
+      } else if (e.key === 'F2' && !inInput) {
+        // F2 下一个书签/标记，Shift+F2 上一个（按偏移循环）
+        e.preventDefault();
+        jumpBookmarkRelative(e.shiftKey ? -1 : 1);
       }
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [selection, copySelection]);
+  }, [
+    selection,
+    copySelection,
+    cursorOffset,
+    fileMeta,
+    bm,
+    addMarkFromSelection,
+    jumpBookmarkRelative,
+  ]);
 
   // 清理计时器
   useEffect(
@@ -280,6 +345,7 @@ function App() {
               onCursorChange={setCursorOffset}
               flashOffset={flashOffset}
               onZoom={zoomFont}
+              bookmarks={bm.sorted}
             />
           ) : (
             <div className="hex-viewer hex-viewer-empty">
@@ -306,6 +372,17 @@ function App() {
             setSelection({ start: offset, end: offset });
             jumpToOffset(offset);
           }}
+          bookmarks={bm.sorted}
+          activeBookmarkId={activeBookmarkId}
+          cursorOffset={cursorOffset}
+          hasSelection={!!selection}
+          maxBookmarkItems={bm.maxRenderItems}
+          onToggleBookmark={bm.toggleBookmarkAt}
+          onAddMark={addMarkFromSelection}
+          onJumpToBookmark={jumpToBookmark}
+          onRemoveBookmark={bm.removeBookmark}
+          onUpdateBookmark={bm.updateBookmark}
+          onClearBookmarks={bm.clearAll}
         />
       </div>
 

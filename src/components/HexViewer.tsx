@@ -7,7 +7,7 @@ import React, {
   useRef,
 } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import type { DisplayConfig, FileMeta, Selection, TextEncoding } from '../types';
+import type { Bookmark, DisplayConfig, FileMeta, Selection, TextEncoding } from '../types';
 import { decodeRow } from '../utils/decode';
 import { byteClass, byteToAscii, hexByte, hexOffset, offsetDigits } from '../utils/format';
 
@@ -32,6 +32,8 @@ interface HexViewerProps {
   /** 跳转目标（搜索/定位），该行闪烁高亮 */
   flashOffset: number | null;
   onZoom: (delta: number) => void;
+  /** 书签与标记（引用稳定：仅在书签变化时更新，不影响 Row memo） */
+  bookmarks: Bookmark[];
 }
 
 interface RowProps {
@@ -51,6 +53,7 @@ interface RowProps {
   cursorOffset: number | null;
   flash: boolean;
   cacheVersion: number;
+  bookmarks: Bookmark[];
   getBytes: (offset: number, len: number) => Uint8Array | null;
 }
 
@@ -58,6 +61,7 @@ interface RowProps {
  * 单行渲染（memo 化）：
  * - data 变化仅发生在分片到达（cacheVersion）时
  * - 选择 / 悬停 / 光标 / 闪烁都以"行内裁剪后的原始值"传入，未涉及的行直接跳过
+ * - bookmarks 引用稳定，行内相关书签在 useMemo 中裁剪
  */
 const Row = React.memo(function Row({
   rowStart,
@@ -73,6 +77,7 @@ const Row = React.memo(function Row({
   cursorOffset,
   flash,
   cacheVersion,
+  bookmarks,
   getBytes,
 }: RowProps) {
   const data = useMemo(
@@ -85,6 +90,23 @@ const Row = React.memo(function Row({
     () => (data && data.length > 0 ? decodeRow(data, encoding) : null),
     [data, encoding],
   );
+
+  // 本行相关的书签/标记：偏移列圆点颜色（行内首个书签）+ 裁剪到行的标记区间
+  const rowMarks = useMemo(() => {
+    if (!bookmarks.length) return null;
+    const rowEnd = rowStart + rowBytes - 1;
+    let dot: string | null = null;
+    const ranges: Array<[number, number, string]> = [];
+    for (const bm of bookmarks) {
+      if (bm.end < rowStart || bm.start > rowEnd) continue;
+      if (bm.start === bm.end) {
+        if (dot === null) dot = bm.color;
+      } else {
+        ranges.push([Math.max(bm.start, rowStart), Math.min(bm.end, rowEnd), bm.color]);
+      }
+    }
+    return dot !== null || ranges.length ? { dot, ranges } : null;
+  }, [bookmarks, rowStart, rowBytes]);
 
   const half = rowBytes >> 1;
   const [selStart, selEnd] = selRange ?? [-1, -1];
@@ -99,6 +121,12 @@ const Row = React.memo(function Row({
     const isHover = exists && off === hoverOffset;
     const isCursor = exists && off === cursorOffset;
     const groupGap = i === half - 1 ? '  ' : ' ';
+    // 落在本字节的标记区间（行内通常 0–2 个，线性查找即可）
+    const markRange = rowMarks?.ranges.find(([s, e]) => off >= s && off <= e);
+    const markStyle = (
+      markRange ? { '--mark': `${markRange[2]}2e` } : null
+    ) as React.CSSProperties | null;
+    const markCls = markRange ? ' mark' : '';
 
     if (!exists) {
       // 文件末尾之外：纯占位，保持列对齐
@@ -108,14 +136,14 @@ const Row = React.memo(function Row({
     }
     if (b === null) {
       // 分片尚未到达
-      const cls = `bs m${inSel ? ' s' : ''}${isHover ? ' v' : ''}${isCursor ? ' cur' : ''}`;
+      const cls = `bs m${inSel ? ' s' : ''}${isHover ? ' v' : ''}${isCursor ? ' cur' : ''}${markCls}`;
       hexCells.push(
-        <span key={i} data-o={off} className={cls}>
+        <span key={i} data-o={off} className={cls} style={markStyle ?? undefined}>
           {'--' + groupGap}
         </span>,
       );
       asciiCells.push(
-        <span key={i} data-o={off} className={cls}>
+        <span key={i} data-o={off} className={cls} style={markStyle ?? undefined}>
           {'·'}
         </span>,
       );
@@ -125,7 +153,8 @@ const Row = React.memo(function Row({
       <span
         key={i}
         data-o={off}
-        className={`${inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`}${isCursor ? ' cur' : ''}`}
+        className={`${inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`}${isCursor ? ' cur' : ''}${markCls}`}
+        style={markStyle ?? undefined}
       >
         {hexByte(b) + groupGap}
       </span>,
@@ -142,7 +171,8 @@ const Row = React.memo(function Row({
         <span
           key={i}
           data-o={off}
-          className={(inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`) + stateCls + (isCursor ? ' cur' : '')}
+          className={(inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`) + stateCls + (isCursor ? ' cur' : '') + markCls}
+          style={markStyle ?? undefined}
         >
           {cell.char}
         </span>,
@@ -153,13 +183,22 @@ const Row = React.memo(function Row({
       // 光标落在字符任一字节上，整个字符标记光标（ASCII 列视觉完整）
       const cellCursor =
         cursorOffset !== null && cursorOffset >= off && cursorOffset < off + cell.units;
+      // 标记覆盖字符任一字节则整个字符叠加标记色
+      const cellMark =
+        rowMarks !== null &&
+        rowMarks.ranges.some(([s, e]) => off <= e && off + cell.units - 1 >= s);
       const stateCls = cell.state === 'cut' ? ' cut' : cell.state === 'invalid' ? ' invalid' : '';
       asciiCells.push(
         <span
           key={i}
           data-o={off}
-          className={`${cellSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`} multi${stateCls}${cellCursor ? ' cur' : ''}`}
-          style={{ width: `${cell.units}ch` }}
+          className={`${cellSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`} multi${stateCls}${cellCursor ? ' cur' : ''}${cellMark ? ' mark' : ''}`}
+          style={
+            {
+              width: `${cell.units}ch`,
+              ...(cellMark && markRange ? { '--mark': `${markRange[2]}2e` } : null),
+            } as React.CSSProperties
+          }
         >
           {cell.char}
         </span>,
@@ -172,7 +211,14 @@ const Row = React.memo(function Row({
       className={`hex-row${flash ? ' flash' : ''}`}
       style={{ height: rowHeight, fontSize, lineHeight: `${rowHeight}px` }}
     >
-      <span className="hex-offset">{hexOffset(rowStart, digits)}</span>
+      <span className="hex-offset">
+        <span className="hex-bm-slot">
+          {rowMarks?.dot != null && (
+            <span className="hex-bm-dot" style={{ background: rowMarks.dot }} />
+          )}
+        </span>
+        {hexOffset(rowStart, digits)}
+      </span>
       <span className="hex-bytes">{hexCells}</span>
       {showAscii && <span className="hex-ascii">{asciiCells}</span>}
     </div>
@@ -194,6 +240,7 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
     onCursorChange,
     flashOffset,
     onZoom,
+    bookmarks,
   },
   ref,
 ) {
@@ -470,6 +517,7 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
                 cursorOffset={cursorInRow}
                 flash={flash}
                 cacheVersion={cacheVersion}
+                bookmarks={bookmarks}
                 getBytes={getBytes}
               />
             </div>

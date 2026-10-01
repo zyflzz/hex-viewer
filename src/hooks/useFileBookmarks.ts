@@ -92,18 +92,19 @@ export function useFileBookmarks(fileMeta: FileMeta | null) {
     saveStore(store);
   }, [bookmarks, path]);
 
-  /** 切换光标处的书签：已有则删除，没有则新建（Ctrl+B） */
-  const toggleBookmarkAt = useCallback((offset: number) => {
-    setBookmarks(prev => {
-      const idx = prev.findIndex(b => b.start === offset && b.end === offset);
-      if (idx >= 0) {
-        const next = prev.slice();
-        next.splice(idx, 1);
-        return next;
-      }
-      return [...prev, { id: newId(), start: offset, end: offset, name: '', color: DEFAULT_MARKER_COLOR, createdAt: Date.now() }];
-    });
-  }, []);
+  /** 切换光标处的书签：已有则删除，没有则新建（Ctrl+B）。返回是否新建 */
+  const toggleBookmarkAt = useCallback(
+    (offset: number): boolean => {
+      const exists = bookmarks.some(b => b.start === offset && b.end === offset);
+      setBookmarks(
+        exists
+          ? prev => prev.filter(b => !(b.start === offset && b.end === offset))
+          : [...bookmarks, { id: newId(), start: offset, end: offset, name: '', color: DEFAULT_MARKER_COLOR, createdAt: Date.now() }],
+      );
+      return !exists;
+    },
+    [bookmarks],
+  );
 
   /** 把选择区间转成标记（Ctrl+Shift+B） */
   const addMark = useCallback((start: number, end: number) => {

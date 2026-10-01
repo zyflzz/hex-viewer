@@ -10,7 +10,7 @@ import { useFileSearch, type SearchMode } from './hooks/useFileSearch';
 import { useFileStats } from './hooks/useFileStats';
 import { usePerfMonitor } from './hooks/usePerfMonitor';
 import { useFileBookmarks } from './hooks/useFileBookmarks';
-import type { Bookmark, Selection, TextEncoding } from './types';
+import type { Bookmark, Selection, SidebarTab, TextEncoding } from './types';
 import { hexByte, parseOffsetInput } from './utils/format';
 import { decodeBytesToText, encodingLabel } from './utils/decode';
 import './App.css';
@@ -66,6 +66,7 @@ function App() {
   const [flashOffset, setFlashOffset] = useState<number | null>(null);
   const [activeHitOffset, setActiveHitOffset] = useState<number | null>(null);
   const [activeBookmarkId, setActiveBookmarkId] = useState<string | null>(null);
+  const [activeSidebarTab, setActiveSidebarTab] = useState<SidebarTab>('info');
   const [visibleRange, setVisibleRange] = useState<{ first: number; last: number }>({
     first: 0,
     last: 0,
@@ -142,15 +143,24 @@ function App() {
     jumpToOffset(parsed);
   }, [fileMeta, gotoText, jumpToOffset, showToast]);
 
-  /** 把当前选择区间转成标记 */
+  /** 把当前选择区间转成标记；成功后切到书签选项卡 */
   const addMarkFromSelection = useCallback(() => {
     if (!selection) {
       showToast('请先选择一个区间');
       return;
     }
     bm.addMark(selection.start, selection.end);
+    setActiveSidebarTab('bookmarks');
     showToast(`已标记 ${selection.end - selection.start + 1} 字节`);
   }, [selection, bm, showToast]);
+
+  /** 切换光标处书签；新建时切到书签选项卡（删除不切换） */
+  const toggleBookmarkAtCursor = useCallback(
+    (offset: number) => {
+      if (bm.toggleBookmarkAt(offset)) setActiveSidebarTab('bookmarks');
+    },
+    [bm],
+  );
 
   /** 跳转到书签/标记：点书签只跳转；范围标记同时选中整个区间 */
   const jumpToBookmark = useCallback(
@@ -184,6 +194,9 @@ function App() {
   );
 
   const handleSearch = useCallback(() => {
+    // 空内容不发搜索，也不切换选项卡
+    if (!searchText.trim()) return;
+    setActiveSidebarTab('search');
     search.runSearch(searchMode, searchText, caseSensitive);
   }, [search, searchMode, searchText, caseSensitive]);
 
@@ -263,7 +276,7 @@ function App() {
         if (e.shiftKey) {
           addMarkFromSelection();
         } else if (cursorOffset !== null && fileMeta && cursorOffset < fileMeta.size) {
-          bm.toggleBookmarkAt(cursorOffset);
+          toggleBookmarkAtCursor(cursorOffset);
         }
       } else if (e.key === 'F2' && !inInput) {
         // F2 下一个书签/标记，Shift+F2 上一个（按偏移循环）
@@ -280,6 +293,7 @@ function App() {
     fileMeta,
     bm,
     addMarkFromSelection,
+    toggleBookmarkAtCursor,
     jumpBookmarkRelative,
   ]);
 
@@ -358,13 +372,23 @@ function App() {
         </main>
 
         <Sidebar
+          activeTab={activeSidebarTab}
+          onTabChange={setActiveSidebarTab}
           meta={fileMeta}
           stats={stats}
-          search={search}
-          perf={perf}
-          cacheBytes={cacheBytes}
-          visibleRows={visibleRows}
           totalRows={totalRows}
+          bookmarks={bm.sorted}
+          activeBookmarkId={activeBookmarkId}
+          cursorOffset={cursorOffset}
+          hasSelection={!!selection}
+          maxBookmarkItems={bm.maxRenderItems}
+          onToggleBookmark={toggleBookmarkAtCursor}
+          onAddMark={addMarkFromSelection}
+          onJumpToBookmark={jumpToBookmark}
+          onRemoveBookmark={bm.removeBookmark}
+          onUpdateBookmark={bm.updateBookmark}
+          onClearBookmarks={bm.clearAll}
+          search={search}
           activeHitOffset={activeHitOffset}
           onJumpToOffset={offset => {
             setActiveHitOffset(offset);
@@ -372,17 +396,9 @@ function App() {
             setSelection({ start: offset, end: offset });
             jumpToOffset(offset);
           }}
-          bookmarks={bm.sorted}
-          activeBookmarkId={activeBookmarkId}
-          cursorOffset={cursorOffset}
-          hasSelection={!!selection}
-          maxBookmarkItems={bm.maxRenderItems}
-          onToggleBookmark={bm.toggleBookmarkAt}
-          onAddMark={addMarkFromSelection}
-          onJumpToBookmark={jumpToBookmark}
-          onRemoveBookmark={bm.removeBookmark}
-          onUpdateBookmark={bm.updateBookmark}
-          onClearBookmarks={bm.clearAll}
+          perf={perf}
+          cacheBytes={cacheBytes}
+          visibleRows={visibleRows}
         />
       </div>
 

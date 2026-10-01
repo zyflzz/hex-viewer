@@ -43,6 +43,9 @@ export interface PerfInfo {
 
 export type ThemeName = 'dark' | 'light' | 'contrast';
 
+/** 侧栏选项卡 */
+export type SidebarTab = 'info' | 'bookmarks' | 'search';
+
 export type BytesPerRow = 8 | 16 | 32;
 
 /** 右侧栏文本编码 */

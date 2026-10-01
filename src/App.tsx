@@ -37,6 +37,7 @@ function App() {
     zoomFont,
     setTheme,
     toggleAscii,
+    setEncoding,
   } = useDisplayConfig();
   const {
     fileMeta,
@@ -245,6 +246,7 @@ function App() {
         onZoom={zoomFont}
         onThemeChange={setTheme}
         onToggleAscii={toggleAscii}
+        onEncodingChange={setEncoding}
       />
 
       <div className="main-content">
@@ -296,6 +298,7 @@ function App() {
         hoverOffset={hoverOffset}
         selection={selection}
         rowBytes={config.bytesPerRow}
+        encoding={config.encoding}
         loading={loading}
         toast={toast}
         onCopyHex={() => copySelection('hex')}

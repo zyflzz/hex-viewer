@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
-import type { DisplayConfig } from '../types';
+import type { DisplayConfig, TextEncoding } from '../types';
 import type { SearchMode } from '../hooks/useFileSearch';
+import { ENCODING_OPTIONS } from '../utils/decode';
 
 interface ToolbarProps {
   hasFile: boolean;
@@ -29,6 +30,7 @@ interface ToolbarProps {
   onZoom: (delta: number) => void;
   onThemeChange: (v: DisplayConfig['theme']) => void;
   onToggleAscii: () => void;
+  onEncodingChange: (v: TextEncoding) => void;
 }
 
 export function Toolbar(props: ToolbarProps) {
@@ -56,6 +58,7 @@ export function Toolbar(props: ToolbarProps) {
     onZoom,
     onThemeChange,
     onToggleAscii,
+    onEncodingChange,
   } = props;
 
   const [showSettings, setShowSettings] = useState(false);
@@ -208,6 +211,21 @@ export function Toolbar(props: ToolbarProps) {
                   </button>
                 ))}
               </div>
+            </div>
+            <div className="settings-row">
+              <label>文本编码</label>
+              <select
+                className="select"
+                title="右侧栏文本按所选编码解释"
+                value={config.encoding}
+                onChange={e => onEncodingChange(e.target.value as TextEncoding)}
+              >
+                {ENCODING_OPTIONS.map(o => (
+                  <option key={o.value} value={o.value}>
+                    {o.label}
+                  </option>
+                ))}
+              </select>
             </div>
             <div className="settings-row">
               <label>ASCII 列</label>

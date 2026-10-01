@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
-import type { BytesPerRow, DisplayConfig, ThemeName } from '../types';
+import type { BytesPerRow, DisplayConfig, TextEncoding, ThemeName } from '../types';
+import { ENCODING_VALUES } from '../utils/decode';
 
 const STORAGE_KEY = 'hex-viewer-config-v1';
 
@@ -8,6 +9,7 @@ const DEFAULT_CONFIG: DisplayConfig = {
   fontSize: 14,
   theme: 'dark',
   showAscii: true,
+  encoding: 'ascii',
 };
 
 function loadConfig(): DisplayConfig {
@@ -27,6 +29,9 @@ function loadConfig(): DisplayConfig {
         ? (parsed.theme as ThemeName)
         : DEFAULT_CONFIG.theme,
       showAscii: typeof parsed.showAscii === 'boolean' ? parsed.showAscii : DEFAULT_CONFIG.showAscii,
+      encoding: ENCODING_VALUES.includes(parsed.encoding as TextEncoding)
+        ? (parsed.encoding as TextEncoding)
+        : DEFAULT_CONFIG.encoding,
     };
   } catch {
     return DEFAULT_CONFIG;
@@ -68,5 +73,9 @@ export function useDisplayConfig() {
     setConfig(c => ({ ...c, showAscii: !c.showAscii }));
   }, []);
 
-  return { config, setBytesPerRow, setFontSize, zoomFont, setTheme, toggleAscii };
+  const setEncoding = useCallback((encoding: TextEncoding) => {
+    setConfig(c => ({ ...c, encoding }));
+  }, []);
+
+  return { config, setBytesPerRow, setFontSize, zoomFont, setTheme, toggleAscii, setEncoding };
 }

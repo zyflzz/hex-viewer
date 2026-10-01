@@ -208,6 +208,22 @@ body {
   opacity: 0.45;
 }
 
+/* 设置弹层内的下拉（文本编码） */
+.select {
+  padding: 4px 8px;
+  background-color: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-size: 12.5px;
+  outline: none;
+  cursor: pointer;
+}
+
+.select:focus {
+  border-color: var(--accent);
+}
+
 .search-input {
   width: 200px;
 }
@@ -389,6 +405,29 @@ body {
 
 .bs.p {
   color: transparent;
+}
+
+/* 多字节字符首字节位：inline-block 以支持按字节位数的宽度（ch） */
+.bs.multi {
+  display: inline-block;
+  white-space: pre;
+}
+
+/* 多字节字符后续字节位：宽度 0、无字形，保留逐字节 span 结构 */
+.bs.cont {
+  display: inline-block;
+  width: 0;
+  overflow: hidden;
+}
+
+/* 行末截断（数据不完整，无法在本行解出字符） */
+.bs.cut {
+  color: var(--bmiss);
+}
+
+/* 非法字节序列 */
+.bs.invalid {
+  color: var(--err);
 }
 
 .bs.v {

@@ -7,7 +7,8 @@ import React, {
   useRef,
 } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import type { DisplayConfig, FileMeta, Selection } from '../types';
+import type { DisplayConfig, FileMeta, Selection, TextEncoding } from '../types';
+import { decodeRow } from '../utils/decode';
 import { byteClass, byteToAscii, hexByte, hexOffset, offsetDigits } from '../utils/format';
 
 export interface HexViewerHandle {
@@ -38,6 +39,7 @@ interface RowProps {
   rowHeight: number;
   digits: number;
   showAscii: boolean;
+  encoding: TextEncoding;
   /** 裁剪到本行的选择区间；无关行为 null，让 memo 跳过重渲染 */
   selRange: [number, number] | null;
   /** 仅当悬停落在本行时为具体偏移 */
@@ -60,6 +62,7 @@ const Row = React.memo(function Row({
   rowHeight,
   digits,
   showAscii,
+  encoding,
   selRange,
   hoverOffset,
   flash,
@@ -69,6 +72,12 @@ const Row = React.memo(function Row({
   const data = useMemo(
     () => getBytes(rowStart, byteCount),
     [getBytes, rowStart, byteCount, cacheVersion],
+  );
+
+  // 行级解码（每行独立、不跨行）；data 到达或编码切换时才重新计算
+  const cells = useMemo(
+    () => (data && data.length > 0 ? decodeRow(data, encoding) : null),
+    [data, encoding],
   );
 
   const half = rowBytes >> 1;
@@ -105,17 +114,39 @@ const Row = React.memo(function Row({
       );
       continue;
     }
-    const base = inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`;
     hexCells.push(
-      <span key={i} data-o={off} className={base}>
+      <span key={i} data-o={off} className={inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`}>
         {hexByte(b) + groupGap}
       </span>,
     );
-    asciiCells.push(
-      <span key={i} data-o={off} className={base}>
-        {byteToAscii(b)}
-      </span>,
-    );
+
+    // 右侧栏：按解码单元渲染，DOM 仍保持每字节一个 span（data-o 为绝对偏移）
+    const cell = cells?.[i] ?? { char: byteToAscii(b), units: 1, state: 'normal' as const };
+    if (cell.units === 0) {
+      // 多字节字符的后续字节位：宽度 0、无字形，保留逐字节结构
+      asciiCells.push(<span key={i} data-o={off} className="bs cont" />);
+    } else if (cell.units === 1) {
+      const stateCls = cell.state === 'cut' ? ' cut' : cell.state === 'invalid' ? ' invalid' : '';
+      asciiCells.push(
+        <span key={i} data-o={off} className={(inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`) + stateCls}>
+          {cell.char}
+        </span>,
+      );
+    } else {
+      // 多字节字符首字节位：占据 units 个字节位宽度；选择命中任一字节则整个字符高亮
+      const cellSel = off <= selEnd && off + cell.units - 1 >= selStart;
+      const stateCls = cell.state === 'cut' ? ' cut' : cell.state === 'invalid' ? ' invalid' : '';
+      asciiCells.push(
+        <span
+          key={i}
+          data-o={off}
+          className={`${cellSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`} multi${stateCls}`}
+          style={{ width: `${cell.units}ch` }}
+        >
+          {cell.char}
+        </span>,
+      );
+    }
   }
 
   return (
@@ -150,7 +181,7 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
   const draggingRef = useRef(false);
   const dragAnchorRef = useRef(0);
 
-  const { bytesPerRow: rowBytes, fontSize, showAscii } = config;
+  const { bytesPerRow: rowBytes, fontSize, showAscii, encoding } = config;
   const rowHeight = Math.round(fontSize * 1.7);
   const digits = offsetDigits(meta.size);
   const totalRows = meta.size === 0 ? 0 : Math.ceil(meta.size / rowBytes);
@@ -311,6 +342,7 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
                 rowHeight={rowHeight}
                 digits={digits}
                 showAscii={showAscii}
+                encoding={encoding}
                 selRange={rowSelRange(v.index)}
                 hoverOffset={hoverInRow}
                 flash={flash}

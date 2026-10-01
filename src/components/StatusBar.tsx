@@ -1,11 +1,13 @@
-import type { FileMeta, Selection } from '../types';
+import type { FileMeta, Selection, TextEncoding } from '../types';
 import { formatBytes, hexOffset, offsetDigits } from '../utils/format';
+import { encodingLabel } from '../utils/decode';
 
 interface StatusBarProps {
   meta: FileMeta | null;
   hoverOffset: number | null;
   selection: Selection | null;
   rowBytes: number;
+  encoding: TextEncoding;
   loading: boolean;
   toast: string | null;
   onCopyHex: () => void;
@@ -17,6 +19,7 @@ export function StatusBar({
   hoverOffset,
   selection,
   rowBytes,
+  encoding,
   loading,
   toast,
   onCopyHex,
@@ -43,6 +46,11 @@ export function StatusBar({
           <button className="btn mini" onClick={onCopyAscii} title="复制选中字节的 ASCII 文本">
             复制 ASCII
           </button>
+        </span>
+      )}
+      {meta && (
+        <span className="status-item">
+          编码 <span className="mono">{encodingLabel(encoding)}</span>
         </span>
       )}
       {meta && (

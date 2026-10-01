@@ -45,11 +45,15 @@ export type ThemeName = 'dark' | 'light' | 'contrast';
 
 export type BytesPerRow = 8 | 16 | 32;
 
+/** 右侧栏文本编码 */
+export type TextEncoding = 'ascii' | 'utf-8' | 'gbk' | 'utf-16le' | 'utf-16be';
+
 export interface DisplayConfig {
   bytesPerRow: BytesPerRow;
   fontSize: number;
   theme: ThemeName;
   showAscii: boolean;
+  encoding: TextEncoding;
 }
 
 /** 字节级选择（含首尾） */

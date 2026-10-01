@@ -26,6 +26,9 @@ interface HexViewerProps {
   onSelectionChange: (sel: Selection | null) => void;
   hoverOffset: number | null;
   onHoverOffsetChange: (offset: number | null) => void;
+  /** 当前光标（键盘导航锚点 / 数据检查器输入源）；空文件为 null */
+  cursorOffset: number | null;
+  onCursorChange: (offset: number) => void;
   /** 跳转目标（搜索/定位），该行闪烁高亮 */
   flashOffset: number | null;
   onZoom: (delta: number) => void;
@@ -44,6 +47,8 @@ interface RowProps {
   selRange: [number, number] | null;
   /** 仅当悬停落在本行时为具体偏移 */
   hoverOffset: number | null;
+  /** 仅当光标落在本行时为具体偏移 */
+  cursorOffset: number | null;
   flash: boolean;
   cacheVersion: number;
   getBytes: (offset: number, len: number) => Uint8Array | null;
@@ -52,7 +57,7 @@ interface RowProps {
 /**
  * 单行渲染（memo 化）：
  * - data 变化仅发生在分片到达（cacheVersion）时
- * - 选择 / 悬停 / 闪烁都以"行内裁剪后的原始值"传入，未涉及的行直接跳过
+ * - 选择 / 悬停 / 光标 / 闪烁都以"行内裁剪后的原始值"传入，未涉及的行直接跳过
  */
 const Row = React.memo(function Row({
   rowStart,
@@ -65,6 +70,7 @@ const Row = React.memo(function Row({
   encoding,
   selRange,
   hoverOffset,
+  cursorOffset,
   flash,
   cacheVersion,
   getBytes,
@@ -91,6 +97,7 @@ const Row = React.memo(function Row({
     const b = exists && data && i < data.length ? data[i] : null;
     const inSel = exists && off >= selStart && off <= selEnd;
     const isHover = exists && off === hoverOffset;
+    const isCursor = exists && off === cursorOffset;
     const groupGap = i === half - 1 ? '  ' : ' ';
 
     if (!exists) {
@@ -101,7 +108,7 @@ const Row = React.memo(function Row({
     }
     if (b === null) {
       // 分片尚未到达
-      const cls = `bs m${inSel ? ' s' : ''}${isHover ? ' v' : ''}`;
+      const cls = `bs m${inSel ? ' s' : ''}${isHover ? ' v' : ''}${isCursor ? ' cur' : ''}`;
       hexCells.push(
         <span key={i} data-o={off} className={cls}>
           {'--' + groupGap}
@@ -115,7 +122,11 @@ const Row = React.memo(function Row({
       continue;
     }
     hexCells.push(
-      <span key={i} data-o={off} className={inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`}>
+      <span
+        key={i}
+        data-o={off}
+        className={`${inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`}${isCursor ? ' cur' : ''}`}
+      >
         {hexByte(b) + groupGap}
       </span>,
     );
@@ -128,19 +139,26 @@ const Row = React.memo(function Row({
     } else if (cell.units === 1) {
       const stateCls = cell.state === 'cut' ? ' cut' : cell.state === 'invalid' ? ' invalid' : '';
       asciiCells.push(
-        <span key={i} data-o={off} className={(inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`) + stateCls}>
+        <span
+          key={i}
+          data-o={off}
+          className={(inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`) + stateCls + (isCursor ? ' cur' : '')}
+        >
           {cell.char}
         </span>,
       );
     } else {
       // 多字节字符首字节位：占据 units 个字节位宽度；选择命中任一字节则整个字符高亮
       const cellSel = off <= selEnd && off + cell.units - 1 >= selStart;
+      // 光标落在字符任一字节上，整个字符标记光标（ASCII 列视觉完整）
+      const cellCursor =
+        cursorOffset !== null && cursorOffset >= off && cursorOffset < off + cell.units;
       const stateCls = cell.state === 'cut' ? ' cut' : cell.state === 'invalid' ? ' invalid' : '';
       asciiCells.push(
         <span
           key={i}
           data-o={off}
-          className={`${cellSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`} multi${stateCls}`}
+          className={`${cellSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`} multi${stateCls}${cellCursor ? ' cur' : ''}`}
           style={{ width: `${cell.units}ch` }}
         >
           {cell.char}
@@ -172,6 +190,8 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
     onSelectionChange,
     hoverOffset,
     onHoverOffsetChange,
+    cursorOffset,
+    onCursorChange,
     flashOffset,
     onZoom,
   },
@@ -180,6 +200,8 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
   const parentRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
   const dragAnchorRef = useRef(0);
+  /** Shift 扩展选择的锚点（首次 Shift 导航前的光标位置） */
+  const shiftAnchorRef = useRef<number | null>(null);
 
   const { bytesPerRow: rowBytes, fontSize, showAscii, encoding } = config;
   const rowHeight = Math.round(fontSize * 1.7);
@@ -231,6 +253,94 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
     return () => el.removeEventListener('wheel', onWheel);
   }, [onZoom]);
 
+  // 松开 Shift 时重置扩展选择锚点
+  useEffect(() => {
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === 'Shift') shiftAnchorRef.current = null;
+    };
+    window.addEventListener('keyup', onKeyUp);
+    return () => window.removeEventListener('keyup', onKeyUp);
+  }, []);
+
+  // 光标移出可视区域时滚动使其可见（尽量少滚动，避免视觉跳动）。
+  // 刻意不依赖 firstRow/lastRow（含 overscan 且随滚动变化），改为直接读滚动容器：
+  // 只有 cursorOffset / 行几何变化才触发，用户手动滚动不会被此副作用拉回。
+  useEffect(() => {
+    if (cursorOffset === null) return;
+    const el = parentRef.current;
+    if (!el) return;
+    const cursorRow = Math.floor(cursorOffset / rowBytes);
+    const firstVisible = Math.floor(el.scrollTop / rowHeight);
+    const lastVisible = Math.floor((el.scrollTop + el.clientHeight - 1) / rowHeight);
+    if (cursorRow < firstVisible) {
+      virtualizer.scrollToIndex(cursorRow, { align: 'start' });
+    } else if (cursorRow > lastVisible) {
+      virtualizer.scrollToIndex(cursorRow, { align: 'end' });
+    }
+  }, [cursorOffset, rowBytes, rowHeight, virtualizer]);
+
+  /** 键盘导航：移动光标；Shift 扩展选择，非 Shift 折叠选择到光标 */
+  const handleKeyDown = useCallback(
+    (e: React.KeyboardEvent) => {
+      if (cursorOffset === null || totalRows === 0) return;
+      const max = meta.size - 1;
+      const cur = cursorOffset;
+
+      if (e.key === 'Escape') {
+        // 选择清空由 App 全局快捷键处理，这里只重置 Shift 锚点
+        shiftAnchorRef.current = null;
+        return;
+      }
+
+      let target: number;
+      switch (e.key) {
+        case 'ArrowLeft':
+          target = cur - 1;
+          break;
+        case 'ArrowRight':
+          target = cur + 1;
+          break;
+        case 'ArrowUp':
+          target = cur - rowBytes;
+          break;
+        case 'ArrowDown':
+          target = cur + rowBytes;
+          break;
+        case 'Home':
+          target = e.ctrlKey || e.metaKey ? 0 : Math.floor(cur / rowBytes) * rowBytes;
+          break;
+        case 'End':
+          target =
+            e.ctrlKey || e.metaKey
+              ? max
+              : Math.min(Math.floor(cur / rowBytes) * rowBytes + rowBytes - 1, max);
+          break;
+        case 'PageUp':
+        case 'PageDown': {
+          const el = parentRef.current;
+          const pageRows = el ? Math.max(1, Math.floor(el.clientHeight / rowHeight)) : 20;
+          target = e.key === 'PageUp' ? cur - pageRows * rowBytes : cur + pageRows * rowBytes;
+          break;
+        }
+        default:
+          return;
+      }
+      e.preventDefault();
+      target = Math.max(0, Math.min(target, max));
+
+      if (e.shiftKey) {
+        if (shiftAnchorRef.current === null) shiftAnchorRef.current = cur;
+        const anchor = shiftAnchorRef.current;
+        onSelectionChange({ start: Math.min(anchor, target), end: Math.max(anchor, target) });
+      } else {
+        shiftAnchorRef.current = null;
+        onSelectionChange({ start: target, end: target });
+      }
+      onCursorChange(target);
+    },
+    [cursorOffset, totalRows, meta.size, rowBytes, rowHeight, onSelectionChange, onCursorChange],
+  );
+
   const offsetFromEvent = useCallback((e: React.MouseEvent): number | null => {
     const el = (e.target as HTMLElement).closest?.('[data-o]');
     if (!el) return null;
@@ -244,6 +354,9 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
       const off = offsetFromEvent(e);
       if (off === null) return;
       e.preventDefault();
+      // preventDefault 会阻止默认聚焦，手动聚焦容器以启用键盘导航
+      parentRef.current?.focus({ preventScroll: true });
+      shiftAnchorRef.current = null;
       if (e.shiftKey && selection) {
         // Shift 点击：以现有选择另一端为锚点扩展
         const anchor = Math.abs(off - selection.start) > Math.abs(off - selection.end)
@@ -255,9 +368,10 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
         dragAnchorRef.current = off;
         onSelectionChange({ start: off, end: off });
       }
+      onCursorChange(off);
       draggingRef.current = true;
     },
-    [offsetFromEvent, selection, onSelectionChange],
+    [offsetFromEvent, selection, onSelectionChange, onCursorChange],
   );
 
   const handleMouseMove = useCallback(
@@ -267,9 +381,11 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
       if (draggingRef.current && off !== null) {
         const anchor = dragAnchorRef.current;
         onSelectionChange({ start: Math.min(anchor, off), end: Math.max(anchor, off) });
+        // 光标跟随拖拽终点（选择区间的活动端点）
+        onCursorChange(off);
       }
     },
-    [offsetFromEvent, onHoverOffsetChange, onSelectionChange],
+    [offsetFromEvent, onHoverOffsetChange, onSelectionChange, onCursorChange],
   );
 
   useEffect(() => {
@@ -304,6 +420,8 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
     <div
       ref={parentRef}
       className="hex-viewer"
+      tabIndex={0}
+      onKeyDown={handleKeyDown}
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
       onMouseLeave={() => onHoverOffsetChange(null)}
@@ -318,6 +436,10 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
           const hoverInRow =
             hoverOffset !== null && hoverOffset >= rowStart && hoverOffset < rowStart + rowBytes
               ? hoverOffset
+              : null;
+          const cursorInRow =
+            cursorOffset !== null && cursorOffset >= rowStart && cursorOffset < rowStart + rowBytes
+              ? cursorOffset
               : null;
           const flash =
             flashOffset !== null && flashOffset >= rowStart && flashOffset < rowStart + rowBytes;
@@ -345,6 +467,7 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
                 encoding={encoding}
                 selRange={rowSelRange(v.index)}
                 hoverOffset={hoverInRow}
+                cursorOffset={cursorInRow}
                 flash={flash}
                 cacheVersion={cacheVersion}
                 getBytes={getBytes}

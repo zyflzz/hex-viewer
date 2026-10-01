@@ -1,5 +1,8 @@
-/* ============ 主题变量 ============ */
-.app-container[data-theme='dark'] {
+/* ============ 主题变量 ============
+   同一份变量挂两处：.app-container（应用子树）与 :root（供 portal 到
+   body 的弹层继承，如状态栏复制菜单），主题切换时由 App 同步 data-theme */
+.app-container[data-theme='dark'],
+:root[data-theme='dark'] {
   --bg: #1e1e1e;
   --panel: #252526;
   --panel2: #2d2d30;
@@ -27,7 +30,8 @@
   color-scheme: dark;
 }
 
-.app-container[data-theme='light'] {
+.app-container[data-theme='light'],
+:root[data-theme='light'] {
   --bg: #ffffff;
   --panel: #f6f8fa;
   --panel2: #eef1f4;
@@ -55,7 +59,8 @@
   color-scheme: light;
 }
 
-.app-container[data-theme='contrast'] {
+.app-container[data-theme='contrast'],
+:root[data-theme='contrast'] {
   --bg: #000000;
   --panel: #0a0a0a;
   --panel2: #1a1a1a;
@@ -319,6 +324,70 @@ body {
   line-height: 1.6;
 }
 
+/* ============ 状态栏复制编码菜单 ============ */
+.copy-anchor {
+  position: relative;
+  display: inline-flex;
+  margin-left: 6px;
+}
+
+/* 覆盖 .btn.mini 的默认 margin，让两个按钮贴合为一组 */
+.copy-anchor .btn {
+  margin-left: 0;
+}
+
+.copy-anchor .btn:first-child {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.copy-anchor .btn + .btn {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+}
+
+/* 向上弹出的编码菜单：portal 到 body + fixed 定位，
+   避免被 .statusbar 的 overflow: hidden 裁剪 */
+.copy-menu {
+  position: fixed;
+  transform: translateY(-100%);
+  z-index: 1000;
+  min-width: 150px;
+  background-color: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  padding: 4px;
+  display: flex;
+  flex-direction: column;
+}
+
+.copy-menu-title {
+  font-size: 11px;
+  color: var(--dim);
+  padding: 4px 8px 6px;
+}
+
+.copy-menu button {
+  padding: 6px 10px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.copy-menu button:hover {
+  background-color: var(--panel2);
+}
+
+.copy-menu button.on {
+  color: var(--accent);
+}
+
 /* ============ 主区域 ============ */
 .main-content {
   display: flex;
@@ -437,6 +506,18 @@ body {
 .bs.s {
   background-color: var(--sel-bg);
   color: var(--sel-fg);
+}
+
+/* 当前光标：outline 不占布局空间，不影响列对齐；定位后置于选择背景之上仍可见 */
+.bs.cur {
+  outline: 1px solid var(--accent);
+  outline-offset: -1px;
+  position: relative;
+  z-index: 1;
+}
+
+.hex-viewer:focus {
+  outline: none;
 }
 
 .empty-state {

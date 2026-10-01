@@ -27,3 +27,4 @@ version_docs/*
 run.bat
 push.bat
 output.md
+mdpy.py

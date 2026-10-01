@@ -9,8 +9,9 @@ import { useFileWindow } from './hooks/useFileWindow';
 import { useFileSearch, type SearchMode } from './hooks/useFileSearch';
 import { useFileStats } from './hooks/useFileStats';
 import { usePerfMonitor } from './hooks/usePerfMonitor';
-import type { Selection } from './types';
-import { byteToAscii, hexByte, parseOffsetInput } from './utils/format';
+import type { Selection, TextEncoding } from './types';
+import { hexByte, parseOffsetInput } from './utils/format';
+import { decodeBytesToText, encodingLabel } from './utils/decode';
 import './App.css';
 
 const MAX_COPY_BYTES = 4 * 1024 * 1024;
@@ -59,6 +60,7 @@ function App() {
 
   const [selection, setSelection] = useState<Selection | null>(null);
   const [hoverOffset, setHoverOffset] = useState<number | null>(null);
+  const [cursorOffset, setCursorOffset] = useState<number | null>(null);
   const [flashOffset, setFlashOffset] = useState<number | null>(null);
   const [activeHitOffset, setActiveHitOffset] = useState<number | null>(null);
   const [visibleRange, setVisibleRange] = useState<{ first: number; last: number }>({
@@ -95,22 +97,26 @@ function App() {
       if (!selected) return;
       setSelection(null);
       setHoverOffset(null);
+      setCursorOffset(null);
       setActiveHitOffset(null);
       setFlashOffset(null);
-      await openFile(selected as string);
+      const meta = await openFile(selected as string);
+      // 光标初始设在偏移 0；空文件不显示光标
+      setCursorOffset(meta.size > 0 ? 0 : null);
     } catch (err) {
       showToast(`打开文件失败: ${err}`);
       console.error(err);
     }
   }, [openFile, showToast]);
 
-  /** 跳转到指定字节偏移（居中 + 闪烁高亮） */
+  /** 跳转到指定字节偏移（居中 + 闪烁高亮 + 光标同步） */
   const jumpToOffset = useCallback(
     (offset: number) => {
       const size = fileMeta?.size ?? 0;
       if (size === 0) return;
       const target = Math.max(0, Math.min(offset, size - 1));
       setFlashOffset(target);
+      setCursorOffset(target);
       hexViewerRef.current?.scrollToOffset(target);
       if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
       flashTimerRef.current = window.setTimeout(() => setFlashOffset(null), 1200);
@@ -136,9 +142,9 @@ function App() {
     search.runSearch(searchMode, searchText, caseSensitive);
   }, [search, searchMode, searchText, caseSensitive]);
 
-  /** 复制选中字节（Hex / ASCII） */
+  /** 复制选中字节（Hex / 按指定编码解码的文本） */
   const copySelection = useCallback(
-    async (mode: 'hex' | 'ascii') => {
+    async (mode: 'hex' | 'text', encoding: TextEncoding = config.encoding) => {
       if (!selection) return;
       const len = selection.end - selection.start + 1;
       if (len > MAX_COPY_BYTES) {
@@ -153,16 +159,16 @@ function App() {
           for (let i = 0; i < data.length; i++) parts[i] = hexByte(data[i]);
           text = parts.join(' ');
         } else {
-          text = Array.from(data, byteToAscii).join('');
+          text = decodeBytesToText(data, encoding);
         }
         await writeClipboard(text);
-        showToast(`已复制 ${len} 字节（${mode === 'hex' ? 'Hex' : 'ASCII'}）`);
+        showToast(`已复制 ${len} 字节（${mode === 'hex' ? 'Hex' : `${encodingLabel(encoding)} 文本`}）`);
       } catch (err) {
         console.error(err);
         showToast('复制失败');
       }
     },
-    [selection, readRange, showToast],
+    [selection, readRange, showToast, config.encoding],
   );
 
   const handleVisibleRangeChange = useCallback(
@@ -176,6 +182,11 @@ function App() {
     },
     [ensureRange, config.bytesPerRow],
   );
+
+  // 主题同步到 :root，供 portal 到 body 的弹层（如复制编码菜单）继承主题变量
+  useEffect(() => {
+    document.documentElement.dataset.theme = config.theme;
+  }, [config.theme]);
 
   // 全局快捷键
   useEffect(() => {
@@ -199,7 +210,8 @@ function App() {
         (document.activeElement as HTMLElement | null)?.blur?.();
       } else if (ctrl && key === 'c' && !inInput && selection) {
         e.preventDefault();
-        copySelection(e.shiftKey ? 'ascii' : 'hex');
+        // Ctrl+C 复制 Hex，Ctrl+Shift+C 按当前显示编码复制文本
+        copySelection(e.shiftKey ? 'text' : 'hex');
       }
     };
     window.addEventListener('keydown', onKey);
@@ -264,6 +276,8 @@ function App() {
               onSelectionChange={setSelection}
               hoverOffset={hoverOffset}
               onHoverOffsetChange={setHoverOffset}
+              cursorOffset={cursorOffset}
+              onCursorChange={setCursorOffset}
               flashOffset={flashOffset}
               onZoom={zoomFont}
             />
@@ -288,6 +302,8 @@ function App() {
           activeHitOffset={activeHitOffset}
           onJumpToOffset={offset => {
             setActiveHitOffset(offset);
+            // 点击搜索结果：选择折叠到命中位置，光标同步（jumpToOffset 内）
+            setSelection({ start: offset, end: offset });
             jumpToOffset(offset);
           }}
         />
@@ -296,13 +312,14 @@ function App() {
       <StatusBar
         meta={fileMeta}
         hoverOffset={hoverOffset}
+        cursorOffset={cursorOffset}
         selection={selection}
         rowBytes={config.bytesPerRow}
         encoding={config.encoding}
         loading={loading}
         toast={toast}
         onCopyHex={() => copySelection('hex')}
-        onCopyAscii={() => copySelection('ascii')}
+        onCopyText={encoding => copySelection('text', encoding)}
       />
     </div>
   );

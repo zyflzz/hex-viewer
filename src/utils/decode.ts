@@ -260,3 +260,39 @@ export function decodeRow(bytes: Uint8Array, encoding: TextEncoding): DisplayCel
   }
   return out;
 }
+
+/** 复制用解码器的共享缓存（非流式、无状态，可安全复用；null 表示该编码不受支持） */
+const textDecoders = new Map<string, TextDecoder | null>();
+
+function getTextDecoder(label: string): TextDecoder | null {
+  const cached = textDecoders.get(label);
+  if (cached !== undefined) return cached;
+  let dec: TextDecoder | null = null;
+  try {
+    dec = new TextDecoder(label);
+  } catch {
+    dec = null;
+  }
+  textDecoders.set(label, dec);
+  return dec;
+}
+
+/**
+ * 把任意长度的字节区间解码为可复制文本（用于剪贴板）。
+ * 与 decodeRow（行级显示）不同：这里跨行流式解码，多字节字符不受行边界影响；
+ * 非法/被截断的序列由 TextDecoder 自动替换为 U+FFFD。
+ * ASCII 保持既有复制习惯：0x20–0x7E 原字符，其余 '.'。
+ */
+export function decodeBytesToText(bytes: Uint8Array, encoding: TextEncoding): string {
+  if (encoding === 'ascii') {
+    let s = '';
+    for (let i = 0; i < bytes.length; i++) {
+      const b = bytes[i];
+      s += b >= 0x20 && b <= 0x7e ? String.fromCharCode(b) : '.';
+    }
+    return s;
+  }
+  const dec = getTextDecoder(encoding);
+  if (!dec) return decodeBytesToText(bytes, 'ascii');
+  return dec.decode(bytes);
+}

@@ -116,7 +116,7 @@ EXCLUDE_FILES = {
     '.ds_store',
     'thumbs.db',
     'desktop.ini',
-	'target'，
+	'target',
 	'assets'
 }
 

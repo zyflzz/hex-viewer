@@ -7,6 +7,10 @@ interface ToolbarProps {
   hasFile: boolean;
   fileName: string | null;
   onOpenFile: () => void;
+  /** 是否有未保存修改（文件名旁显示 •） */
+  unsaved: boolean;
+  /** 关闭当前文件（有未保存修改时 App 层弹确认） */
+  onCloseFile: () => void;
   // 搜索
   searchMode: SearchMode;
   setSearchMode: (m: SearchMode) => void;
@@ -38,6 +42,8 @@ export function Toolbar(props: ToolbarProps) {
     hasFile,
     fileName,
     onOpenFile,
+    unsaved,
+    onCloseFile,
     searchMode,
     setSearchMode,
     searchText,
@@ -83,8 +89,22 @@ export function Toolbar(props: ToolbarProps) {
       </button>
       {fileName && (
         <span className="toolbar-file" title={fileName}>
+          {unsaved && (
+            <span className="unsaved-dot" title="有未保存的修改">
+              ●
+            </span>
+          )}
           {fileName}
         </span>
+      )}
+      {hasFile && (
+        <button
+          className="btn icon file-close"
+          onClick={onCloseFile}
+          title="关闭当前文件"
+        >
+          ✕
+        </button>
       )}
 
       <div className="toolbar-sep" />

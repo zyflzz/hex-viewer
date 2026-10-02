@@ -1,10 +1,12 @@
-import type { Bookmark, FileMeta, SidebarTab } from '../types';
+import type { Bookmark, EditMode, FileMeta, SidebarTab } from '../types';
 import type { StatsState } from '../hooks/useFileStats';
 import type { SearchState } from '../hooks/useFileSearch';
 import type { PerfState } from '../hooks/usePerfMonitor';
+import type { EditOp } from '../hooks/useFileEdits';
 import { SidebarInfo } from './SidebarInfo';
 import { SidebarBookmarks } from './SidebarBookmarks';
 import { SidebarSearch } from './SidebarSearch';
+import { SidebarEdit } from './SidebarEdit';
 import { SidebarPerf } from './SidebarPerf';
 
 interface SidebarProps {
@@ -31,13 +33,29 @@ interface SidebarProps {
   search: SearchState;
   activeHitOffset: number | null;
   onJumpToOffset: (offset: number) => void;
+  // 编辑
+  editMode: EditMode;
+  onEditModeChange: (m: EditMode) => void;
+  confirmSave: boolean;
+  onConfirmSaveChange: (v: boolean) => void;
+  editCount: number;
+  canUndo: boolean;
+  canRedo: boolean;
+  onUndo: () => void;
+  onRedo: () => void;
+  onUndoTo: (index: number) => void;
+  onRedoTo: (index: number) => void;
+  ops: EditOp[];
+  pos: number;
+  onEditSelection: () => void;
+  onDiscardAll: () => void;
   // 性能（公共底部）
   perf: PerfState;
   cacheBytes: number;
   visibleRows: number;
 }
 
-/** 侧栏容器：顶部选项卡栏 + 三个常驻 pane（display 切换保留状态）+ 底部性能监控 */
+/** 侧栏容器：顶部选项卡栏 + 四个常驻 pane（display 切换保留状态）+ 底部性能监控 */
 export function Sidebar(props: SidebarProps) {
   const {
     activeTab,
@@ -59,6 +77,21 @@ export function Sidebar(props: SidebarProps) {
     search,
     activeHitOffset,
     onJumpToOffset,
+    editMode,
+    onEditModeChange,
+    confirmSave,
+    onConfirmSaveChange,
+    editCount,
+    canUndo,
+    canRedo,
+    onUndo,
+    onRedo,
+    onUndoTo,
+    onRedoTo,
+    ops,
+    pos,
+    onEditSelection,
+    onDiscardAll,
     perf,
     cacheBytes,
     visibleRows,
@@ -106,6 +139,17 @@ export function Sidebar(props: SidebarProps) {
           搜索
           {searchBadge && <span className="tab-badge">{searchBadge}</span>}
         </button>
+        <button
+          className={`sidebar-tab${activeTab === 'edit' ? ' on' : ''}`}
+          role="tab"
+          aria-selected={activeTab === 'edit'}
+          onClick={() => onTabChange('edit')}
+        >
+          编辑
+          {editCount > 0 && (
+            <span className="tab-badge">{editCount > 99 ? '99+' : editCount}</span>
+          )}
+        </button>
       </div>
 
       <div className="sidebar-body">
@@ -131,9 +175,35 @@ export function Sidebar(props: SidebarProps) {
         <div className="sidebar-pane" style={{ display: activeTab === 'search' ? 'block' : 'none' }}>
           <SidebarSearch meta={meta} search={search} activeHitOffset={activeHitOffset} onJumpToOffset={onJumpToOffset} />
         </div>
+        <div className="sidebar-pane" style={{ display: activeTab === 'edit' ? 'block' : 'none' }}>
+          <SidebarEdit
+            meta={meta}
+            editMode={editMode}
+            onEditModeChange={onEditModeChange}
+            confirmSave={confirmSave}
+            onConfirmSaveChange={onConfirmSaveChange}
+            editCount={editCount}
+            canUndo={canUndo}
+            canRedo={canRedo}
+            onUndo={onUndo}
+            onRedo={onRedo}
+            onUndoTo={onUndoTo}
+            onRedoTo={onRedoTo}
+            ops={ops}
+            pos={pos}
+            onEditSelection={onEditSelection}
+            onDiscardAll={onDiscardAll}
+          />
+        </div>
       </div>
 
-      <SidebarPerf perf={perf} cacheBytes={cacheBytes} visibleRows={visibleRows} totalRows={totalRows} />
+      <SidebarPerf
+        perf={perf}
+        cacheBytes={cacheBytes}
+        visibleRows={visibleRows}
+        totalRows={totalRows}
+        editCount={editCount}
+      />
     </aside>
   );
 }

@@ -1,17 +1,21 @@
-import { useCallback, useEffect, useRef, useState } from 'react';
-import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 import { HexViewer, type HexViewerHandle } from './components/HexViewer';
 import { Toolbar } from './components/Toolbar';
 import { Sidebar } from './components/Sidebar';
 import { StatusBar } from './components/StatusBar';
+import { EditDialog } from './components/EditDialog';
+import { ConfirmDialog } from './components/ConfirmDialog';
 import { useDisplayConfig } from './hooks/useDisplayConfig';
 import { useFileWindow } from './hooks/useFileWindow';
+import { useFileEdits } from './hooks/useFileEdits';
 import { useFileSearch, type SearchMode } from './hooks/useFileSearch';
 import { useFileStats } from './hooks/useFileStats';
 import { usePerfMonitor } from './hooks/usePerfMonitor';
 import { useFileBookmarks } from './hooks/useFileBookmarks';
-import type { Bookmark, Selection, SidebarTab, TextEncoding } from './types';
-import { hexByte, parseOffsetInput } from './utils/format';
+import type { Bookmark, FileMeta, Selection, SidebarTab, TextEncoding } from './types';
+import { hexByte, hexOffset, offsetDigits, parseOffsetInput } from './utils/format';
 import { decodeBytesToText, encodingLabel } from './utils/decode';
 import './App.css';
 
@@ -40,6 +44,8 @@ function App() {
     setTheme,
     toggleAscii,
     setEncoding,
+    setEditMode,
+    setConfirmSave,
   } = useDisplayConfig();
   const {
     fileMeta,
@@ -47,6 +53,8 @@ function App() {
     cacheBytes,
     loading,
     openFile,
+    closeFile,
+    resetChunks,
     ensureRange,
     getBytes,
     readRange,
@@ -55,6 +63,7 @@ function App() {
   const stats = useFileStats(fileMeta);
   const perf = usePerfMonitor(true);
   const bm = useFileBookmarks(fileMeta);
+  const edit = useFileEdits(fileMeta);
 
   const hexViewerRef = useRef<HexViewerHandle>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -78,6 +87,22 @@ function App() {
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [gotoText, setGotoText] = useState('');
 
+  // 编辑状态：直接模式行内编辑目标 / 对话框编辑区间 / 各确认弹窗 / 保存中
+  const [directEditOffset, setDirectEditOffset] = useState<number | null>(null);
+  const [editDialogRange, setEditDialogRange] = useState<{ start: number; end: number } | null>(
+    null,
+  );
+  /** 未保存时挂起的动作：确认（保存/放弃）后执行 */
+  const [unsavedAction, setUnsavedAction] = useState<{
+    kind: 'open' | 'close';
+    path: string | null;
+  } | null>(null);
+  const [saveConfirmOpen, setSaveConfirmOpen] = useState(false);
+  const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
+  /** 待确认的"撤销到指定操作"目标索引（操作记录中撤销早期操作需二次确认） */
+  const [undoConfirmIndex, setUndoConfirmIndex] = useState<number | null>(null);
+  const [saving, setSaving] = useState(false);
+
   const [toast, setToast] = useState<string | null>(null);
   const toastTimerRef = useRef<number | null>(null);
   const flashTimerRef = useRef<number | null>(null);
@@ -91,6 +116,40 @@ function App() {
   const totalRows = fileMeta ? Math.ceil(fileMeta.size / config.bytesPerRow) : 0;
   const visibleRows = Math.max(0, visibleRange.last - visibleRange.first + 1);
 
+  /** 清空与具体文件绑定的一切交互状态（打开/关闭文件共用） */
+  const resetInteractionState = useCallback(() => {
+    setSelection(null);
+    setHoverOffset(null);
+    setCursorOffset(null);
+    setActiveHitOffset(null);
+    setActiveBookmarkId(null);
+    setFlashOffset(null);
+    setDirectEditOffset(null);
+    setEditDialogRange(null);
+  }, []);
+
+  /** 实际执行打开（无确认） */
+  const performOpen = useCallback(
+    async (path: string) => {
+      resetInteractionState();
+      try {
+        const meta = await openFile(path);
+        // 光标初始设在偏移 0；空文件不显示光标
+        setCursorOffset(meta.size > 0 ? 0 : null);
+      } catch (err) {
+        showToast(`打开文件失败: ${err}`);
+        console.error(err);
+      }
+    },
+    [openFile, resetInteractionState, showToast],
+  );
+
+  /** 实际执行关闭（无确认） */
+  const performClose = useCallback(() => {
+    closeFile();
+    resetInteractionState();
+  }, [closeFile, resetInteractionState]);
+
   const handleOpenFile = useCallback(async () => {
     try {
       const selected = await openFileDialog({
@@ -99,20 +158,35 @@ function App() {
         filters: [{ name: '所有文件', extensions: ['*'] }],
       });
       if (!selected) return;
-      setSelection(null);
-      setHoverOffset(null);
-      setCursorOffset(null);
-      setActiveHitOffset(null);
-      setActiveBookmarkId(null);
-      setFlashOffset(null);
-      const meta = await openFile(selected as string);
-      // 光标初始设在偏移 0；空文件不显示光标
-      setCursorOffset(meta.size > 0 ? 0 : null);
+      const path = selected as string;
+      if (edit.editCount > 0) {
+        setUnsavedAction({ kind: 'open', path });
+        return;
+      }
+      await performOpen(path);
     } catch (err) {
       showToast(`打开文件失败: ${err}`);
       console.error(err);
     }
-  }, [openFile, showToast]);
+  }, [edit.editCount, performOpen, showToast]);
+
+  const handleCloseFile = useCallback(() => {
+    if (!fileMeta) return;
+    if (edit.editCount > 0) {
+      setUnsavedAction({ kind: 'close', path: null });
+      return;
+    }
+    performClose();
+  }, [fileMeta, edit.editCount, performClose]);
+
+  /** 未保存确认后执行挂起的打开/关闭动作 */
+  const proceedUnsaved = useCallback(
+    (action: { kind: 'open' | 'close'; path: string | null }) => {
+      if (action.kind === 'open' && action.path) void performOpen(action.path);
+      else if (action.kind === 'close') performClose();
+    },
+    [performOpen, performClose],
+  );
 
   /** 跳转到指定字节偏移（居中 + 闪烁高亮 + 光标同步） */
   const jumpToOffset = useCallback(
@@ -211,6 +285,11 @@ function App() {
       }
       try {
         const data = await readRange(selection.start, len);
+        // 应用编辑覆盖层：复制内容与视图所见一致
+        for (let i = 0; i < data.length; i++) {
+          const v = edit.edits.get(selection.start + i);
+          if (v !== undefined) data[i] = v;
+        }
         let text: string;
         if (mode === 'hex') {
           const parts = new Array<string>(data.length);
@@ -226,7 +305,227 @@ function App() {
         showToast('复制失败');
       }
     },
-    [selection, readRange, showToast, config.encoding],
+    [selection, readRange, showToast, config.encoding, edit.edits],
+  );
+
+  // ---------- 编辑：覆盖层应用 / 保存 / 编辑入口 ----------
+
+  /** 应用编辑覆盖层的字节读取：无编辑零拷贝；仅含编辑的行拷贝替换（行宽 ≤32，常数开销） */
+  const displayGetBytes = useCallback(
+    (offset: number, len: number): Uint8Array | null => {
+      const raw = getBytes(offset, len);
+      if (!raw) return null;
+      if (edit.edits.size === 0) return raw;
+      let has = false;
+      for (let i = 0; i < raw.length; i++) {
+        if (edit.edits.has(offset + i)) {
+          has = true;
+          break;
+        }
+      }
+      if (!has) return raw;
+      const out = new Uint8Array(raw.length);
+      out.set(raw);
+      for (let i = 0; i < out.length; i++) {
+        const v = edit.edits.get(offset + i);
+        if (v !== undefined) out[i] = v;
+      }
+      return out;
+    },
+    [getBytes, edit.edits],
+  );
+
+  /** 覆盖层 → 后端保存载荷（offset + 新字节值） */
+  const changesPayload = useMemo(
+    () => Array.from(edit.edits.entries()).map(([offset, value]) => ({ offset, value })),
+    [edit.edits],
+  );
+
+  /** 就地保存（临时文件 + 原子替换）。返回是否成功（供"保存并继续"流程使用） */
+  const doSave = useCallback(async (): Promise<boolean> => {
+    if (!fileMeta || edit.editCount === 0) return true;
+    if (fileMeta.is_readonly) {
+      showToast('文件为只读，请改用另存为（Ctrl+Shift+S）');
+      return false;
+    }
+    if (saving) return false;
+    setSaving(true);
+    try {
+      const meta = await invoke<FileMeta>('save_file', { changes: changesPayload, path: null });
+      edit.afterSave(); // 清覆盖层，保留撤销栈（可继续撤销到保存前）
+      resetChunks(meta); // Rust 侧已重新 mmap，重载分片
+      // resetChunks 只预载头部分片；用户可能停在文件中部，
+      // 可视区间不会自动重新上报（未滚动/未重挂载），手动补拉
+      const rb = config.bytesPerRow;
+      ensureRange(visibleRange.first * rb, (visibleRange.last + 1) * rb - 1);
+      showToast('已保存');
+      return true;
+    } catch (err) {
+      showToast(`保存失败: ${err}`);
+      console.error(err);
+      return false;
+    } finally {
+      setSaving(false);
+    }
+  }, [
+    fileMeta,
+    edit,
+    changesPayload,
+    saving,
+    resetChunks,
+    showToast,
+    config.bytesPerRow,
+    ensureRange,
+    visibleRange,
+  ]);
+
+  /** 另存为：写目标路径，当前文件与覆盖层均保持不变 */
+  const doSaveAs = useCallback(async () => {
+    if (!fileMeta || saving) return;
+    try {
+      const target = await saveFileDialog({ defaultPath: fileMeta.path });
+      if (!target) return;
+      setSaving(true);
+      await invoke<FileMeta>('save_file', { changes: changesPayload, path: target });
+      const name = (target as string).split(/[\\/]/).pop() ?? '新文件';
+      showToast(`已另存为 ${name}`);
+    } catch (err) {
+      showToast(`另存为失败: ${err}`);
+      console.error(err);
+    } finally {
+      setSaving(false);
+    }
+  }, [fileMeta, changesPayload, saving, showToast]);
+
+  /** Ctrl+S：可选保存前确认 */
+  const handleSaveShortcut = useCallback(() => {
+    if (!fileMeta || edit.editCount === 0 || saving) return;
+    if (config.confirmSave) setSaveConfirmOpen(true);
+    else void doSave();
+  }, [fileMeta, edit.editCount, saving, config.confirmSave, doSave]);
+
+  /** 直接模式：双击字节 / Ctrl+E 进入行内编辑（光标与选择同步到该字节） */
+  const handleEditStart = useCallback(
+    (offset: number) => {
+      if (!fileMeta) return;
+      if (fileMeta.is_readonly) {
+        showToast('文件为只读，无法编辑（可另存为）');
+        return;
+      }
+      setDirectEditOffset(offset);
+      setCursorOffset(offset);
+      setSelection({ start: offset, end: offset });
+    },
+    [fileMeta, showToast],
+  );
+
+  /**
+   * 编辑入口（Ctrl+E / 侧栏"开始编辑"）：按当前模式分流。
+   * - 对话框模式：弹出编辑对话框，区间 = 选中区间 ?? 光标单字节
+   * - 直接模式：光标处字节进入行内编辑（无对话框）
+   */
+  const startEdit = useCallback(() => {
+    if (!fileMeta || fileMeta.size === 0) return;
+    if (fileMeta.is_readonly) {
+      showToast('文件为只读，无法编辑（可另存为）');
+      return;
+    }
+    if (cursorOffset === null && !selection) {
+      showToast('请先点击一个字节设置光标');
+      return;
+    }
+    // 开始编辑即切到编辑选项卡（两种模式都生效），便于查看操作记录
+    setActiveSidebarTab('edit');
+    if (config.editMode === 'direct') {
+      handleEditStart(cursorOffset ?? selection!.start);
+      return;
+    }
+    const range =
+      selection ??
+      (cursorOffset !== null ? { start: cursorOffset, end: cursorOffset } : null);
+    if (!range) return;
+    setEditDialogRange(range);
+  }, [fileMeta, config.editMode, cursorOffset, selection, handleEditStart, showToast]);
+
+  const handleEditCommit = useCallback(
+    (offset: number, oldValue: number, newValue: number) => {
+      setDirectEditOffset(null);
+      edit.applyEdit(
+        [{ offset, oldValue, newValue }],
+        `@${hexOffset(offset, offsetDigits(fileMeta?.size ?? 0))} ${hexByte(oldValue)}→${hexByte(newValue)}`,
+      );
+    },
+    [edit, fileMeta],
+  );
+
+  const handleEditCancel = useCallback(() => {
+    setDirectEditOffset(null);
+  }, []);
+
+  /** 对话框"当前值"：原始内容 + 覆盖层（与视图一致） */
+  const loadDialogBytes = useCallback(async () => {
+    if (!editDialogRange) return new Uint8Array(0);
+    const { start, end } = editDialogRange;
+    const len = end - start + 1;
+    const raw = await readRange(start, len);
+    for (let i = 0; i < len; i++) {
+      const v = edit.edits.get(start + i);
+      if (v !== undefined) raw[i] = v;
+    }
+    return raw;
+  }, [editDialogRange, readRange, edit.edits]);
+
+  /** 对话框提交：与当前值 diff 生成 change 列表（oldValue = 覆盖层当前值） */
+  const commitDialogEdit = useCallback(
+    async (newBytes: Uint8Array) => {
+      const range = editDialogRange;
+      if (!range) return;
+      setEditDialogRange(null);
+      const len = range.end - range.start + 1;
+      try {
+        const cur = await readRange(range.start, len);
+        const changes: Array<{ offset: number; oldValue: number; newValue: number }> = [];
+        for (let i = 0; i < len; i++) {
+          const original = cur[i];
+          const current = edit.edits.get(range.start + i) ?? original;
+          if (current !== newBytes[i]) {
+            changes.push({
+              offset: range.start + i,
+              oldValue: current,
+              newValue: newBytes[i],
+            });
+          }
+        }
+        if (changes.length) {
+          const digits = offsetDigits(fileMeta?.size ?? 0);
+          const label =
+            changes.length === 1
+              ? `@${hexOffset(range.start, digits)} ${hexByte(changes[0].oldValue)}→${hexByte(changes[0].newValue)}`
+              : `${changes.length} 字节 @${hexOffset(range.start, digits)}`;
+          edit.applyEdit(changes, label);
+        } else showToast('内容无变化');
+      } catch (err) {
+        console.error(err);
+        showToast('读取当前内容失败');
+      }
+    },
+    [editDialogRange, readRange, edit, showToast, fileMeta],
+  );
+
+  /**
+   * 从操作记录撤销到指定操作：
+   * - 目标即最近一次生效操作：等同于 Ctrl+Z，直接执行
+   * - 更早的操作：会一并撤销其后所有操作，先弹确认
+   */
+  const requestUndoTo = useCallback(
+    (index: number) => {
+      if (index === edit.pos - 1) {
+        edit.undoTo(index);
+        return;
+      }
+      setUndoConfirmIndex(index);
+    },
+    [edit],
   );
 
   const handleVisibleRangeChange = useCallback(
@@ -246,6 +545,21 @@ function App() {
     document.documentElement.dataset.theme = config.theme;
   }, [config.theme]);
 
+  // 编辑结束（行内编辑框 / 对话框卸载）后焦点会落到 body，方向键导航失效；
+  // 仅在焦点仍停留在 body 时重新聚焦视图容器（用户已点击其他控件则不抢焦点）
+  const prevDirectEdit = useRef<number | null>(null);
+  const prevDialogRange = useRef<{ start: number; end: number } | null>(null);
+  useEffect(() => {
+    const wasEditing = prevDirectEdit.current !== null || prevDialogRange.current !== null;
+    prevDirectEdit.current = directEditOffset;
+    prevDialogRange.current = editDialogRange;
+    if (wasEditing && directEditOffset === null && editDialogRange === null) {
+      if (document.activeElement === document.body) {
+        hexViewerRef.current?.focus();
+      }
+    }
+  }, [directEditOffset, editDialogRange]);
+
   // 全局快捷键
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -264,6 +578,20 @@ function App() {
         gotoInputRef.current?.focus();
         gotoInputRef.current?.select();
       } else if (e.key === 'Escape') {
+        // 弹窗打开时由弹窗自行处理 Escape；行内编辑框已 stopPropagation 不会到达这里
+        if (
+          editDialogRange ||
+          unsavedAction ||
+          saveConfirmOpen ||
+          discardConfirmOpen ||
+          undoConfirmIndex !== null
+        ) {
+          return;
+        }
+        if (directEditOffset !== null) {
+          setDirectEditOffset(null);
+          return;
+        }
         setSelection(null);
         (document.activeElement as HTMLElement | null)?.blur?.();
       } else if (ctrl && key === 'c' && !inInput && selection) {
@@ -282,6 +610,33 @@ function App() {
         // F2 下一个书签/标记，Shift+F2 上一个（按偏移循环）
         e.preventDefault();
         jumpBookmarkRelative(e.shiftKey ? -1 : 1);
+      } else if (ctrl && key === 's' && !inInput) {
+        // Ctrl+S 保存（可配置确认），Ctrl+Shift+S 另存为
+        e.preventDefault();
+        if (e.shiftKey) void doSaveAs();
+        else handleSaveShortcut();
+      } else if (ctrl && (key === 'z' || key === 'y') && !inInput) {
+        // Ctrl+Z 撤销最近一次，Ctrl+Y / Ctrl+Shift+Z 恢复最近一次
+        e.preventDefault();
+        if (key === 'y' || e.shiftKey) edit.redoLast();
+        else edit.undoLast();
+      } else if (ctrl && key === 'e' && !inInput) {
+        // Ctrl+E 按当前模式开始编辑
+        e.preventDefault();
+        startEdit();
+      } else if (e.key === 'Enter' && !inInput) {
+        // Enter 开始编辑；弹窗打开时由弹窗处理，行内编辑框已 stopPropagation
+        if (
+          !editDialogRange &&
+          !unsavedAction &&
+          !saveConfirmOpen &&
+          !discardConfirmOpen &&
+          undoConfirmIndex === null &&
+          directEditOffset === null
+        ) {
+          e.preventDefault();
+          startEdit();
+        }
       }
     };
     window.addEventListener('keydown', onKey);
@@ -295,6 +650,16 @@ function App() {
     addMarkFromSelection,
     toggleBookmarkAtCursor,
     jumpBookmarkRelative,
+    editDialogRange,
+    unsavedAction,
+    saveConfirmOpen,
+    discardConfirmOpen,
+    undoConfirmIndex,
+    directEditOffset,
+    doSaveAs,
+    handleSaveShortcut,
+    edit,
+    startEdit,
   ]);
 
   // 清理计时器
@@ -317,6 +682,8 @@ function App() {
         hasFile={!!fileMeta}
         fileName={fileMeta?.name ?? null}
         onOpenFile={handleOpenFile}
+        unsaved={edit.editCount > 0}
+        onCloseFile={handleCloseFile}
         searchMode={searchMode}
         setSearchMode={setSearchMode}
         searchText={searchText}
@@ -349,7 +716,7 @@ function App() {
               meta={fileMeta}
               config={config}
               cacheVersion={cacheVersion}
-              getBytes={getBytes}
+              getBytes={displayGetBytes}
               onVisibleRangeChange={handleVisibleRangeChange}
               selection={selection}
               onSelectionChange={setSelection}
@@ -360,6 +727,12 @@ function App() {
               flashOffset={flashOffset}
               onZoom={zoomFont}
               bookmarks={bm.sorted}
+              edits={edit.edits}
+              editMode={config.editMode}
+              editTarget={directEditOffset}
+              onEditStart={handleEditStart}
+              onEditCommit={handleEditCommit}
+              onEditCancel={handleEditCancel}
             />
           ) : (
             <div className="hex-viewer hex-viewer-empty">
@@ -396,6 +769,21 @@ function App() {
             setSelection({ start: offset, end: offset });
             jumpToOffset(offset);
           }}
+          editMode={config.editMode}
+          onEditModeChange={setEditMode}
+          confirmSave={config.confirmSave}
+          onConfirmSaveChange={setConfirmSave}
+          editCount={edit.editCount}
+          canUndo={edit.canUndo}
+          canRedo={edit.canRedo}
+          onUndo={edit.undoLast}
+          onRedo={edit.redoLast}
+          onUndoTo={requestUndoTo}
+          onRedoTo={edit.redoTo}
+          ops={edit.ops}
+          pos={edit.pos}
+          onEditSelection={startEdit}
+          onDiscardAll={() => setDiscardConfirmOpen(true)}
           perf={perf}
           cacheBytes={cacheBytes}
           visibleRows={visibleRows}
@@ -414,6 +802,128 @@ function App() {
         onCopyHex={() => copySelection('hex')}
         onCopyText={encoding => copySelection('text', encoding)}
       />
+
+      {/* 对话框编辑（Ctrl+E） */}
+      {editDialogRange && fileMeta && (
+        <EditDialog
+          start={editDialogRange.start}
+          end={editDialogRange.end}
+          digits={offsetDigits(fileMeta.size)}
+          loadBytes={loadDialogBytes}
+          onCommit={commitDialogEdit}
+          onCancel={() => setEditDialogRange(null)}
+        />
+      )}
+
+      {/* 未保存三选一（打开/关闭文件前） */}
+      {unsavedAction && (
+        <ConfirmDialog
+          title="有未保存的修改"
+          message={`当前文件有 ${edit.editCount} 字节未保存修改，如何处理？`}
+          buttons={[
+            {
+              label: '保存并继续',
+              kind: 'primary',
+              onClick: () => {
+                const action = unsavedAction;
+                setUnsavedAction(null);
+                void doSave().then(ok => {
+                  if (ok) proceedUnsaved(action);
+                });
+              },
+            },
+            {
+              label: '放弃修改并继续',
+              kind: 'danger',
+              onClick: () => {
+                const action = unsavedAction;
+                setUnsavedAction(null);
+                edit.discardUnsaved();
+                proceedUnsaved(action);
+              },
+            },
+            {
+              label: '取消',
+              kind: 'plain',
+              onClick: () => setUnsavedAction(null),
+            },
+          ]}
+          onCancel={() => setUnsavedAction(null)}
+        />
+      )}
+
+      {/* 保存前确认 */}
+      {saveConfirmOpen && (
+        <ConfirmDialog
+          title="保存修改"
+          message={`将把 ${edit.editCount} 字节修改写入 ${fileMeta?.name ?? '当前文件'}，是否继续？`}
+          buttons={[
+            {
+              label: '保存',
+              kind: 'primary',
+              onClick: () => {
+                setSaveConfirmOpen(false);
+                void doSave();
+              },
+            },
+            {
+              label: '取消',
+              kind: 'plain',
+              onClick: () => setSaveConfirmOpen(false),
+            },
+          ]}
+          onCancel={() => setSaveConfirmOpen(false)}
+        />
+      )}
+
+      {/* 放弃全部修改确认 */}
+      {discardConfirmOpen && (
+        <ConfirmDialog
+          title="放弃全部修改"
+          message={`将丢弃 ${edit.editCount} 字节未保存修改（不可恢复），是否继续？`}
+          buttons={[
+            {
+              label: '放弃修改',
+              kind: 'danger',
+              onClick: () => {
+                setDiscardConfirmOpen(false);
+                edit.discardUnsaved();
+                showToast('已放弃未保存的修改');
+              },
+            },
+            {
+              label: '取消',
+              kind: 'plain',
+              onClick: () => setDiscardConfirmOpen(false),
+            },
+          ]}
+          onCancel={() => setDiscardConfirmOpen(false)}
+        />
+      )}
+
+      {/* 撤销到指定历史操作确认 */}
+      {undoConfirmIndex !== null && edit.ops[undoConfirmIndex] && (
+        <ConfirmDialog
+          title="撤销到指定操作"
+          message={`将撤销「${edit.ops[undoConfirmIndex].label}」及其后共 ${edit.pos - undoConfirmIndex} 个操作，是否继续？`}
+          buttons={[
+            {
+              label: '撤销',
+              kind: 'danger',
+              onClick: () => {
+                edit.undoTo(undoConfirmIndex);
+                setUndoConfirmIndex(null);
+              },
+            },
+            {
+              label: '取消',
+              kind: 'plain',
+              onClick: () => setUndoConfirmIndex(null),
+            },
+          ]}
+          onCancel={() => setUndoConfirmIndex(null)}
+        />
+      )}
     </div>
   );
 }

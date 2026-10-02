@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import type { BytesPerRow, DisplayConfig, TextEncoding, ThemeName } from '../types';
+import type { BytesPerRow, DisplayConfig, EditMode, TextEncoding, ThemeName } from '../types';
 import { ENCODING_VALUES } from '../utils/decode';
 
 const STORAGE_KEY = 'hex-viewer-config-v1';
@@ -10,6 +10,8 @@ const DEFAULT_CONFIG: DisplayConfig = {
   theme: 'dark',
   showAscii: true,
   encoding: 'ascii',
+  editMode: 'dialog',
+  confirmSave: false,
 };
 
 function loadConfig(): DisplayConfig {
@@ -32,6 +34,11 @@ function loadConfig(): DisplayConfig {
       encoding: ENCODING_VALUES.includes(parsed.encoding as TextEncoding)
         ? (parsed.encoding as TextEncoding)
         : DEFAULT_CONFIG.encoding,
+      editMode: (['dialog', 'direct'] as EditMode[]).includes(parsed.editMode as EditMode)
+        ? (parsed.editMode as EditMode)
+        : DEFAULT_CONFIG.editMode,
+      confirmSave:
+        typeof parsed.confirmSave === 'boolean' ? parsed.confirmSave : DEFAULT_CONFIG.confirmSave,
     };
   } catch {
     return DEFAULT_CONFIG;
@@ -77,5 +84,23 @@ export function useDisplayConfig() {
     setConfig(c => ({ ...c, encoding }));
   }, []);
 
-  return { config, setBytesPerRow, setFontSize, zoomFont, setTheme, toggleAscii, setEncoding };
+  const setEditMode = useCallback((editMode: EditMode) => {
+    setConfig(c => ({ ...c, editMode }));
+  }, []);
+
+  const setConfirmSave = useCallback((confirmSave: boolean) => {
+    setConfig(c => ({ ...c, confirmSave }));
+  }, []);
+
+  return {
+    config,
+    setBytesPerRow,
+    setFontSize,
+    zoomFont,
+    setTheme,
+    toggleAscii,
+    setEncoding,
+    setEditMode,
+    setConfirmSave,
+  };
 }

@@ -102,23 +102,29 @@ export function useFileWindow() {
     [bumpCache],
   );
 
+  /** 重置分片缓存并按新元数据预载（打开文件 / 保存后重新 mmap 共用） */
+  const resetChunks = useCallback(
+    (meta: FileMeta) => {
+      tokenRef.current += 1;
+      chunksRef.current.clear();
+      pendingRef.current.clear();
+      fileMetaRef.current = meta;
+      setFileMeta(meta);
+      setCacheBytes(0);
+      setCacheVersion(v => v + 1);
+      setLoading(false);
+      const token = tokenRef.current;
+      fetchChunk(0, token);
+      if (meta.size > CHUNK_SIZE) fetchChunk(1, token);
+    },
+    [fetchChunk],
+  );
+
   const openFile = useCallback(async (path: string): Promise<FileMeta> => {
     const meta = await invoke<FileMeta>('open_file', { path });
-    // 重置全部窗口状态（含在途请求的 loading 标记）
-    tokenRef.current += 1;
-    chunksRef.current.clear();
-    pendingRef.current.clear();
-    fileMetaRef.current = meta;
-    setFileMeta(meta);
-    setCacheBytes(0);
-    setCacheVersion(v => v + 1);
-    setLoading(false);
-    // 预载开头两个分片
-    const token = tokenRef.current;
-    fetchChunk(0, token);
-    if (meta.size > CHUNK_SIZE) fetchChunk(1, token);
+    resetChunks(meta);
     return meta;
-  }, [fetchChunk]);
+  }, [resetChunks]);
 
   /**
    * 保证 [startByte, endByte] 覆盖的分片在缓存中（可见区立即加载，邻接区延迟预取）
@@ -242,6 +248,7 @@ export function useFileWindow() {
     loading,
     openFile,
     closeFile,
+    resetChunks,
     ensureRange,
     getBytes,
     readRange,

@@ -33,10 +33,12 @@ interface SidebarPerfProps {
   cacheBytes: number;
   visibleRows: number;
   totalRows: number;
+  /** 未保存编辑字节数 */
+  editCount: number;
 }
 
 /** 性能监控：固定在侧栏底部，所有选项卡共享 */
-export function SidebarPerf({ perf, cacheBytes, visibleRows, totalRows }: SidebarPerfProps) {
+export function SidebarPerf({ perf, cacheBytes, visibleRows, totalRows, editCount }: SidebarPerfProps) {
   return (
     <div className="sidebar-perf">
       <h3>性能监控</h3>
@@ -61,6 +63,12 @@ export function SidebarPerf({ perf, cacheBytes, visibleRows, totalRows }: Sideba
       <div className="perf-row plain">
         <span className="perf-label">渲染行数</span>
         <span className="perf-value">{visibleRows} / {totalRows ? formatNumber(totalRows) : '-'}</span>
+      </div>
+      <div className="perf-row plain">
+        <span className="perf-label">未保存修改</span>
+        <span className={`perf-value${editCount > 0 ? ' warn' : ''}`}>
+          {editCount > 0 ? `${formatNumber(editCount)} 字节` : '无修改'}
+        </span>
       </div>
     </div>
   );

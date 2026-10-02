@@ -5,14 +5,17 @@ import React, {
   useImperativeHandle,
   useMemo,
   useRef,
+  useState,
 } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
-import type { Bookmark, DisplayConfig, FileMeta, Selection, TextEncoding } from '../types';
+import type { Bookmark, DisplayConfig, EditMode, FileMeta, Selection, TextEncoding } from '../types';
 import { decodeRow } from '../utils/decode';
 import { byteClass, byteToAscii, hexByte, hexOffset, offsetDigits } from '../utils/format';
 
 export interface HexViewerHandle {
   scrollToOffset: (offset: number) => void;
+  /** 聚焦视图容器（恢复键盘导航；编辑框/对话框卸载后焦点会落到 body） */
+  focus: () => void;
 }
 
 interface HexViewerProps {
@@ -20,6 +23,7 @@ interface HexViewerProps {
   config: DisplayConfig;
   /** 分片缓存版本号，变化时行数据重新提取 */
   cacheVersion: number;
+  /** 已应用编辑覆盖层的字节读取（App 层包装） */
   getBytes: (offset: number, len: number) => Uint8Array | null;
   onVisibleRangeChange: (startByte: number, endByte: number) => void;
   selection: Selection | null;
@@ -34,6 +38,15 @@ interface HexViewerProps {
   onZoom: (delta: number) => void;
   /** 书签与标记（引用稳定：仅在书签变化时更新，不影响 Row memo） */
   bookmarks: Bookmark[];
+  /** 编辑覆盖层：偏移 → 新字节（引用稳定，仅编辑时变化） */
+  edits: ReadonlyMap<number, number>;
+  /** 编辑输入模式：direct 时双击字节进入原地编辑 */
+  editMode: EditMode;
+  /** 直接模式当前编辑的字节偏移 */
+  editTarget: number | null;
+  onEditStart: (offset: number) => void;
+  onEditCommit: (offset: number, oldValue: number, newValue: number) => void;
+  onEditCancel: () => void;
 }
 
 interface RowProps {
@@ -54,7 +67,73 @@ interface RowProps {
   flash: boolean;
   cacheVersion: number;
   bookmarks: Bookmark[];
+  edits: ReadonlyMap<number, number>;
+  /** 仅当直接编辑落在本行时为具体偏移 */
+  editTarget: number | null;
+  onEditCommit: (offset: number, oldValue: number, newValue: number) => void;
+  onEditCancel: () => void;
   getBytes: (offset: number, len: number) => Uint8Array | null;
+}
+
+/** 直接模式行内编辑框：两位 Hex 自动提交，Escape 取消，失焦提交合法值 */
+function ByteEditor({
+  offset,
+  initial,
+  rowHeight,
+  onCommit,
+  onCancel,
+}: {
+  offset: number;
+  /** 当前字节值（含覆盖层） */
+  initial: number;
+  rowHeight: number;
+  onCommit: (offset: number, oldValue: number, newValue: number) => void;
+  onCancel: () => void;
+}) {
+  const [text, setText] = useState(hexByte(initial));
+  const ref = useRef<HTMLInputElement>(null);
+  const doneRef = useRef(false);
+
+  useEffect(() => {
+    ref.current?.focus();
+    ref.current?.select();
+  }, []);
+
+  const commit = (val: string) => {
+    if (doneRef.current) return;
+    doneRef.current = true;
+    const v = val.replace(/[^0-9a-fA-F]/g, '').toUpperCase();
+    if (v.length === 2) {
+      const n = parseInt(v, 16);
+      if (n !== initial) onCommit(offset, initial, n);
+      else onCancel();
+    } else {
+      onCancel();
+    }
+  };
+
+  return (
+    <input
+      ref={ref}
+      className="byte-editor"
+      style={{ height: Math.max(16, rowHeight - 6) }}
+      value={text}
+      maxLength={2}
+      spellCheck={false}
+      onChange={e => {
+        const v = e.target.value.replace(/[^0-9a-fA-F]/g, '').toUpperCase();
+        setText(v);
+        if (v.length === 2) commit(v); // 两位自动提交
+      }}
+      onKeyDown={e => {
+        // 阻止事件冒泡到容器（方向键移动光标 / 全局快捷键）
+        e.stopPropagation();
+        if (e.key === 'Escape') onCancel();
+        else if (e.key === 'Enter') commit(text);
+      }}
+      onBlur={() => commit(text)}
+    />
+  );
 }
 
 /**
@@ -78,6 +157,10 @@ const Row = React.memo(function Row({
   flash,
   cacheVersion,
   bookmarks,
+  edits,
+  editTarget,
+  onEditCommit,
+  onEditCancel,
   getBytes,
 }: RowProps) {
   const data = useMemo(
@@ -120,6 +203,7 @@ const Row = React.memo(function Row({
     const inSel = exists && off >= selStart && off <= selEnd;
     const isHover = exists && off === hoverOffset;
     const isCursor = exists && off === cursorOffset;
+    const isEdited = edits.has(off);
     const groupGap = i === half - 1 ? '  ' : ' ';
     // 落在本字节的标记区间（行内通常 0–2 个，线性查找即可）
     const markRange = rowMarks?.ranges.find(([s, e]) => off >= s && off <= e);
@@ -127,6 +211,7 @@ const Row = React.memo(function Row({
       markRange ? { '--mark': `${markRange[2]}2e` } : null
     ) as React.CSSProperties | null;
     const markCls = markRange ? ' mark' : '';
+    const editCls = isEdited ? ' edited' : '';
 
     if (!exists) {
       // 文件末尾之外：纯占位，保持列对齐
@@ -136,7 +221,7 @@ const Row = React.memo(function Row({
     }
     if (b === null) {
       // 分片尚未到达
-      const cls = `bs m${inSel ? ' s' : ''}${isHover ? ' v' : ''}${isCursor ? ' cur' : ''}${markCls}`;
+      const cls = `bs m${inSel ? ' s' : ''}${isHover ? ' v' : ''}${isCursor ? ' cur' : ''}${markCls}${editCls}`;
       hexCells.push(
         <span key={i} data-o={off} className={cls} style={markStyle ?? undefined}>
           {'--' + groupGap}
@@ -149,16 +234,32 @@ const Row = React.memo(function Row({
       );
       continue;
     }
-    hexCells.push(
-      <span
-        key={i}
-        data-o={off}
-        className={`${inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`}${isCursor ? ' cur' : ''}${markCls}`}
-        style={markStyle ?? undefined}
-      >
-        {hexByte(b) + groupGap}
-      </span>,
-    );
+    if (off === editTarget) {
+      // 直接模式：HEX 列该字节位置渲染行内编辑框（ASCII 列照常）；
+      // 编辑框后补间隙占位，保持后续字节列对齐
+      hexCells.push(
+        <ByteEditor
+          key={i}
+          offset={off}
+          initial={b}
+          rowHeight={rowHeight}
+          onCommit={onEditCommit}
+          onCancel={onEditCancel}
+        />,
+      );
+      hexCells.push(<span key={`${i}-g`} className="bs p">{groupGap}</span>);
+    } else {
+      hexCells.push(
+        <span
+          key={i}
+          data-o={off}
+          className={`${inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`}${isCursor ? ' cur' : ''}${markCls}${editCls}`}
+          style={markStyle ?? undefined}
+        >
+          {hexByte(b) + groupGap}
+        </span>,
+      );
+    }
 
     // 右侧栏：按解码单元渲染，DOM 仍保持每字节一个 span（data-o 为绝对偏移）
     const cell = cells?.[i] ?? { char: byteToAscii(b), units: 1, state: 'normal' as const };
@@ -171,7 +272,7 @@ const Row = React.memo(function Row({
         <span
           key={i}
           data-o={off}
-          className={(inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`) + stateCls + (isCursor ? ' cur' : '') + markCls}
+          className={(inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`) + stateCls + (isCursor ? ' cur' : '') + markCls + editCls}
           style={markStyle ?? undefined}
         >
           {cell.char}
@@ -192,7 +293,7 @@ const Row = React.memo(function Row({
         <span
           key={i}
           data-o={off}
-          className={`${cellSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`} multi${stateCls}${cellCursor ? ' cur' : ''}${cellMark ? ' mark' : ''}`}
+          className={`${cellSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`} multi${stateCls}${cellCursor ? ' cur' : ''}${cellMark ? ' mark' : ''}${editCls}`}
           style={
             {
               width: `${cell.units}ch`,
@@ -241,6 +342,12 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
     flashOffset,
     onZoom,
     bookmarks,
+    edits,
+    editMode,
+    editTarget,
+    onEditStart,
+    onEditCommit,
+    onEditCancel,
   },
   ref,
 ) {
@@ -272,6 +379,9 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
     () => ({
       scrollToOffset: (offset: number) => {
         virtualizer.scrollToIndex(Math.floor(offset / rowBytes), { align: 'center' });
+      },
+      focus: () => {
+        parentRef.current?.focus({ preventScroll: true });
       },
     }),
     [rowBytes, virtualizer],
@@ -421,6 +531,17 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
     [offsetFromEvent, selection, onSelectionChange, onCursorChange],
   );
 
+  /** 直接编辑模式：双击字节进入行内编辑 */
+  const handleDoubleClick = useCallback(
+    (e: React.MouseEvent) => {
+      if (editMode !== 'direct') return;
+      const off = offsetFromEvent(e);
+      if (off === null) return;
+      onEditStart(off);
+    },
+    [editMode, offsetFromEvent, onEditStart],
+  );
+
   const handleMouseMove = useCallback(
     (e: React.MouseEvent) => {
       const off = offsetFromEvent(e);
@@ -472,6 +593,7 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
       onMouseDown={handleMouseDown}
       onMouseMove={handleMouseMove}
       onMouseLeave={() => onHoverOffsetChange(null)}
+      onDoubleClick={handleDoubleClick}
     >
       <div
         className="hex-total"
@@ -487,6 +609,10 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
           const cursorInRow =
             cursorOffset !== null && cursorOffset >= rowStart && cursorOffset < rowStart + rowBytes
               ? cursorOffset
+              : null;
+          const editTargetInRow =
+            editTarget !== null && editTarget >= rowStart && editTarget < rowStart + rowBytes
+              ? editTarget
               : null;
           const flash =
             flashOffset !== null && flashOffset >= rowStart && flashOffset < rowStart + rowBytes;
@@ -518,6 +644,10 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
                 flash={flash}
                 cacheVersion={cacheVersion}
                 bookmarks={bookmarks}
+                edits={edits}
+                editTarget={editTargetInRow}
+                onEditCommit={onEditCommit}
+                onEditCancel={onEditCancel}
                 getBytes={getBytes}
               />
             </div>

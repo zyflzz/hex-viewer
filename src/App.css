@@ -27,6 +27,7 @@
   --perf-mem: #4fc1ff;
   --perf-cpu: #f0a45d;
   --scroll: #4f4f4f;
+  --edit: #e5b567;
   color-scheme: dark;
 }
 
@@ -56,6 +57,7 @@
   --perf-mem: #0969da;
   --perf-cpu: #bc4c00;
   --scroll: #c4ccd4;
+  --edit: #b26a00;
   color-scheme: light;
 }
 
@@ -85,6 +87,7 @@
   --perf-mem: #4fe3ff;
   --perf-cpu: #ffd700;
   --scroll: #777777;
+  --edit: #ff9500;
   color-scheme: dark;
 }
 
@@ -497,6 +500,34 @@ body {
 /* 非法字节序列 */
 .bs.invalid {
   color: var(--err);
+}
+
+/* 已编辑字节（未保存）：琥珀色 + 点状下划线。
+   刻意置于 .bs.v / .bs.s 之前——悬停/选择时其颜色优先；
+   下划线保留，选中区间内仍可辨认已编辑字节 */
+.bs.edited {
+  color: var(--edit);
+  text-decoration: underline dotted;
+  text-underline-offset: 3px;
+}
+
+/* 直接模式行内编辑框：覆盖在字节位上，等宽字体保持列宽。
+   负 margin 抵消左右边框宽度，编辑期间后续字节不移位 */
+.byte-editor {
+  width: 2ch;
+  padding: 0;
+  margin: 0 -1px;
+  border: 1px solid var(--accent);
+  border-radius: 2px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: inherit;
+  font-size: inherit;
+  line-height: 1;
+  text-align: center;
+  text-decoration: none;
+  outline: none;
+  vertical-align: middle;
 }
 
 .bs.v {
@@ -1061,4 +1092,343 @@ body {
 
 ::-webkit-scrollbar-corner {
   background: transparent;
+}
+
+/* ============ 编辑功能 ============ */
+
+/* 工具栏：未保存圆点 */
+.unsaved-dot {
+  color: var(--edit);
+  font-size: 10px;
+  margin-right: 4px;
+  vertical-align: 1px;
+}
+
+/* 工具栏：关闭文件按钮（紧凑） */
+.file-close {
+  padding: 2px 7px;
+  font-size: 12px;
+  line-height: 1.2;
+  color: var(--dim);
+}
+
+.file-close:hover:not(:disabled) {
+  color: var(--err);
+}
+
+/* 性能监控：未保存修改告警色 */
+.perf-value.warn {
+  color: var(--edit);
+}
+
+/* 危险按钮（放弃修改等） */
+.btn.danger {
+  background: transparent;
+  border-color: var(--err);
+  color: var(--err);
+}
+
+.btn.danger:hover:not(:disabled) {
+  background: var(--err);
+  color: var(--bg);
+}
+
+/* ---- 弹窗（portal 到 body，主题变量经 :root[data-theme] 继承） ---- */
+.modal-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 1000;
+}
+
+.modal {
+  min-width: 360px;
+  max-width: min(560px, 90vw);
+  max-height: 80vh;
+  overflow-y: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.4);
+  padding: 16px 20px 14px;
+}
+
+.modal-title {
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 10px;
+  color: var(--text);
+}
+
+.modal-body {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.7;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+
+/* ---- 编辑对话框 ---- */
+.edit-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+
+.edit-row.column {
+  flex-direction: column;
+  gap: 6px;
+}
+
+.edit-label {
+  flex: none;
+  width: 56px;
+  font-size: 12px;
+  color: var(--dim);
+}
+
+.edit-current {
+  font-size: 12px;
+  color: var(--dim);
+  word-break: break-all;
+  line-height: 1.5;
+}
+
+.edit-input {
+  width: 100%;
+  min-height: 64px;
+  resize: vertical;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12.5px;
+  padding: 6px 8px;
+  outline: none;
+}
+
+.edit-input:focus {
+  border-color: var(--accent);
+}
+
+.edit-hint {
+  font-size: 11.5px;
+  color: var(--dim);
+}
+
+.edit-hint.err {
+  color: var(--err);
+}
+
+/* ---- 编辑选项卡 ---- */
+.edit-opt {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.edit-opt .edit-label {
+  width: auto;
+}
+
+.edit-count {
+  font-size: 12.5px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+.edit-count.has {
+  color: var(--edit);
+  font-weight: 600;
+}
+
+.edit-btns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.edit-tip {
+  font-size: 11.5px;
+  color: var(--dim);
+  line-height: 1.8;
+  margin: 0 0 6px;
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+/* ---- 操作记录（编辑选项卡） ---- */
+.edit-log-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin: 4px 0 6px;
+  font-size: 12px;
+  color: var(--dim);
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.edit-log-count {
+  font-variant-numeric: tabular-nums;
+}
+
+.edit-log {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 12px;
+}
+
+.edit-log-item {
+  position: relative;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 6px;
+  border-radius: 4px;
+}
+
+.edit-log-item:hover {
+  background: var(--hover-bg);
+}
+
+.edit-log-item.undone {
+  opacity: 0.55;
+}
+
+/* 时间线：竖线贯穿各条记录（圆点压在线上），顶端箭头指向最新 */
+.edit-log-item::before {
+  content: '';
+  position: absolute;
+  left: 9px;
+  top: 0;
+  bottom: 0;
+  width: 1px;
+  background: var(--border);
+  pointer-events: none;
+}
+
+/* 最新一条：线自箭头起（箭头在其上方） */
+.edit-log-item:first-child::before {
+  top: 12px;
+}
+
+.edit-log-item:first-child::after {
+  content: '';
+  position: absolute;
+  left: 6px;
+  top: 3px;
+  width: 7px;
+  height: 7px;
+  border-left: 1px solid var(--dim);
+  border-top: 1px solid var(--dim);
+  transform: rotate(45deg);
+  pointer-events: none;
+}
+
+/* 最旧一条：线止于圆点（时间轴起点） */
+.edit-log-item:last-child::before {
+  bottom: 50%;
+}
+
+.op-dot {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--edit);
+}
+
+.op-dot.off {
+  background: var(--dim);
+}
+
+.op-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.op-label {
+  font-size: 12px;
+  color: var(--text);
+  font-family: 'Cascadia Code', 'Consolas', monospace;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.op-time {
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.op-act {
+  flex: none;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--dim);
+  cursor: pointer;
+}
+
+.op-act:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.edit-log-empty {
+  font-size: 12px;
+  color: var(--dim);
+  margin: 2px 0 12px;
+}
+
+/* ---- 开关（保存前确认） ---- */
+.toggle {
+  position: relative;
+  width: 34px;
+  height: 18px;
+  border-radius: 9px;
+  border: 1px solid var(--border);
+  background: var(--panel2);
+  cursor: pointer;
+  padding: 0;
+  transition: background 0.15s;
+}
+
+.toggle-knob {
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 12px;
+  height: 12px;
+  border-radius: 50%;
+  background: var(--dim);
+  transition: transform 0.15s, background 0.15s;
+}
+
+.toggle.on {
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.toggle.on .toggle-knob {
+  transform: translateX(16px);
+  background: var(--accent-fg);
 }

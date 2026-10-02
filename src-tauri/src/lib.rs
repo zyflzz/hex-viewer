@@ -4,6 +4,7 @@
 // - 后台全文件统计分析（字符数等，带进度）
 // - 进程内存 / CPU 性能数据
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -186,14 +187,9 @@ fn detect_kind(d: &[u8], ext: &str) -> String {
     }
 }
 
-/// 打开文件：只建立 mmap 映射并返回元数据，不把文件读入内存
-#[tauri::command]
-fn open_file(path: String, state: State<AppState>) -> Result<FileMeta, String> {
-    // 打开新文件时中止仍在运行的搜索 / 统计
-    state.search_gen.fetch_add(1, Ordering::SeqCst);
-    state.analysis_gen.fetch_add(1, Ordering::SeqCst);
-
-    let file = fs::File::open(&path).map_err(|e| format!("无法打开文件: {}", e))?;
+/// 打开并映射文件，构造 OpenedFile（open_file / save_file 共用）
+fn open_mapped(path: &str) -> Result<Arc<OpenedFile>, String> {
+    let file = fs::File::open(path).map_err(|e| format!("无法打开文件: {}", e))?;
     let md = file
         .metadata()
         .map_err(|e| format!("无法读取文件信息: {}", e))?;
@@ -204,12 +200,11 @@ fn open_file(path: String, state: State<AppState>) -> Result<FileMeta, String> {
     } else {
         None
     };
-
-    let name = Path::new(&path)
+    let name = Path::new(path)
         .file_name()
         .map(|s| s.to_string_lossy().to_string())
         .unwrap_or_else(|| "unknown".into());
-    let extension = Path::new(&path)
+    let extension = Path::new(path)
         .extension()
         .map(|s| s.to_string_lossy().to_lowercase())
         .unwrap_or_default();
@@ -220,9 +215,8 @@ fn open_file(path: String, state: State<AppState>) -> Result<FileMeta, String> {
         Some(m) => detect_kind(&m[..m.len().min(64)], &extension),
         None => "空文件".into(),
     };
-
-    let opened = Arc::new(OpenedFile {
-        path,
+    Ok(Arc::new(OpenedFile {
+        path: path.to_string(),
         name,
         size,
         modified,
@@ -231,7 +225,17 @@ fn open_file(path: String, state: State<AppState>) -> Result<FileMeta, String> {
         kind,
         is_readonly,
         mmap,
-    });
+    }))
+}
+
+/// 打开文件：只建立 mmap 映射并返回元数据，不把文件读入内存
+#[tauri::command]
+fn open_file(path: String, state: State<AppState>) -> Result<FileMeta, String> {
+    // 打开新文件时中止仍在运行的搜索 / 统计
+    state.search_gen.fetch_add(1, Ordering::SeqCst);
+    state.analysis_gen.fetch_add(1, Ordering::SeqCst);
+
+    let opened = open_mapped(&path)?;
     let meta = FileMeta::from(opened.as_ref());
     *state.file.lock().unwrap() = Some(opened);
     Ok(meta)
@@ -262,6 +266,148 @@ fn read_chunk(offset: u64, length: u64, state: State<AppState>) -> Result<tauri:
         Vec::new()
     };
     Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// 前端覆盖层的单条字节修改
+#[derive(serde::Deserialize)]
+pub struct ByteChange {
+    pub offset: u64,
+    pub value: u8,
+}
+
+/// 保存的核心流程（阻塞线程内执行）：
+/// 1. 合并同一偏移的多次修改（BTreeMap 自动按偏移有序）
+/// 2. 原文件内容 + 修改 → 写同目录临时文件（sync 落盘）
+/// 3. rename 原子替换目标文件
+///
+/// 写回原文件时必须先解除 mmap（Windows 上被映射的文件无法被 rename 覆盖），
+/// 成功后重新映射；另存为则不动当前打开的文件。
+/// 返回 (新元数据, 应放回 state 的文件句柄)；失败时句柄为原文件或重开的原文件。
+fn save_file_blocking(
+    opened: Arc<OpenedFile>,
+    changes: Vec<ByteChange>,
+    path: Option<String>,
+) -> Result<(FileMeta, Arc<OpenedFile>), (String, Option<Arc<OpenedFile>>)> {
+    let in_place = path.is_none();
+    let save_path = path.unwrap_or_else(|| opened.path.clone());
+    if in_place && opened.is_readonly {
+        return Err(("文件为只读，请改用另存为".into(), Some(opened)));
+    }
+
+    let mut merged = std::collections::BTreeMap::new();
+    for c in changes {
+        if c.offset >= opened.size {
+            return Err((
+                format!("偏移 {} 超出文件末尾（文件共 {} 字节）", c.offset, opened.size),
+                Some(opened),
+            ));
+        }
+        merged.insert(c.offset, c.value);
+    }
+
+    let src: &[u8] = opened.mmap.as_ref().map(|m| &m[..]).unwrap_or(&[]);
+    let dir = Path::new(&save_path)
+        .parent()
+        .map(Path::to_path_buf)
+        .unwrap_or_default();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp = dir.join(format!(".hexsave-{}-{}", std::process::id(), nanos));
+
+    let write = (|| -> std::io::Result<()> {
+        let mut out = fs::File::create(&tmp)?;
+        let mut pos: u64 = 0;
+        for (off, val) in &merged {
+            if *off > pos {
+                out.write_all(&src[pos as usize..*off as usize])?;
+            }
+            out.write_all(&[*val])?;
+            pos = off + 1;
+        }
+        if (pos as usize) < src.len() {
+            out.write_all(&src[pos as usize..])?;
+        }
+        out.sync_all()?;
+        Ok(())
+    })();
+    if let Err(e) = write {
+        let _ = fs::remove_file(&tmp);
+        return Err((format!("写入临时文件失败: {}", e), Some(opened)));
+    }
+
+    if !in_place {
+        // 另存为：目标路径覆盖写入，当前打开的文件不受影响
+        return match fs::rename(&tmp, &save_path) {
+            Ok(()) => Ok((FileMeta::from(opened.as_ref()), opened)),
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                Err((format!("另存为失败: {}", e), Some(opened)))
+            }
+        };
+    }
+
+    // 写回原文件：解除 mmap 后 rename，再重新打开映射
+    let orig_path = opened.path.clone();
+    drop(opened);
+    if let Err(e) = fs::rename(&tmp, &save_path) {
+        let _ = fs::remove_file(&tmp);
+        // 原文件仍在磁盘上，重新打开恢复句柄
+        return match open_mapped(&orig_path) {
+            Ok(f) => Err((format!("替换原文件失败: {}", e), Some(f))),
+            Err(re) => Err((format!("替换原文件失败: {}（恢复打开也失败: {}）", e, re), None)),
+        };
+    }
+    match open_mapped(&save_path) {
+        Ok(reopened) => {
+            let meta = FileMeta::from(reopened.as_ref());
+            Ok((meta, reopened))
+        }
+        Err(e) => Err((format!("已写入但重新打开文件失败: {}", e), None)),
+    }
+}
+
+/// 保存覆盖层修改：path 为 None 写回当前文件，Some 为另存为。
+/// 异步命令 + spawn_blocking，大文件复制不阻塞 IPC。
+#[tauri::command]
+async fn save_file(
+    changes: Vec<ByteChange>,
+    path: Option<String>,
+    state: State<'_, AppState>,
+) -> Result<FileMeta, String> {
+    let opened = state
+        .file
+        .lock()
+        .unwrap()
+        .take()
+        .ok_or("尚未打开文件")?;
+    let orig_path = opened.path.clone();
+    let handle =
+        tauri::async_runtime::spawn_blocking(move || save_file_blocking(opened, changes, path));
+    match handle.await {
+        Ok(Ok((meta, file))) => {
+            *state.file.lock().unwrap() = Some(file);
+            Ok(meta)
+        }
+        Ok(Err((msg, Some(file)))) => {
+            *state.file.lock().unwrap() = Some(file);
+            Err(msg)
+        }
+        Ok(Err((msg, None))) => {
+            // 句柄已丢失（如 panic 或重开失败），尽力恢复
+            if let Ok(f) = open_mapped(&orig_path) {
+                *state.file.lock().unwrap() = Some(f);
+            }
+            Err(msg)
+        }
+        Err(e) => {
+            if let Ok(f) = open_mapped(&orig_path) {
+                *state.file.lock().unwrap() = Some(f);
+            }
+            Err(format!("保存任务失败: {}", e))
+        }
+    }
 }
 
 #[derive(Clone, Serialize)]
@@ -569,6 +715,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_file,
             read_chunk,
+            save_file,
             search,
             cancel_search,
             analyze_file,

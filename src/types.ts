@@ -44,7 +44,10 @@ export interface PerfInfo {
 export type ThemeName = 'dark' | 'light' | 'contrast';
 
 /** 侧栏选项卡 */
-export type SidebarTab = 'info' | 'bookmarks' | 'search';
+export type SidebarTab = 'info' | 'bookmarks' | 'search' | 'edit';
+
+/** 编辑输入模式：对话框（Ctrl+E）/ 直接（双击字节原地编辑） */
+export type EditMode = 'dialog' | 'direct';
 
 export type BytesPerRow = 8 | 16 | 32;
 
@@ -57,6 +60,10 @@ export interface DisplayConfig {
   theme: ThemeName;
   showAscii: boolean;
   encoding: TextEncoding;
+  /** 编辑输入模式（全局偏好，与文件无关） */
+  editMode: EditMode;
+  /** 保存前二次确认 */
+  confirmSave: boolean;
 }
 
 /** 字节级选择（含首尾） */

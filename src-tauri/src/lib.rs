@@ -15,6 +15,8 @@ use serde::Serialize;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tauri::{Emitter, State};
 
+mod versions;
+
 /// 单次 read_chunk 返回的最大字节数
 const MAX_CHUNK_LEN: u64 = 8 * 1024 * 1024;
 /// 搜索 / 统计扫描的分块大小（同时是进度事件与取消检查的粒度）
@@ -47,6 +49,23 @@ pub struct FileMeta {
     is_readonly: bool,
 }
 
+impl OpenedFile {
+    /// 供版本存储模块校验：当前打开的文件是否为指定路径
+    pub(crate) fn matches_path(&self, p: &str) -> bool {
+        self.path == p
+    }
+
+    /// 当前文件路径（版本目录名按路径散列）
+    pub(crate) fn path_string(&self) -> &str {
+        &self.path
+    }
+
+    /// mmap 数据切片（空文件为 None）
+    pub(crate) fn mmap_bytes(&self) -> Option<&[u8]> {
+        self.mmap.as_ref().map(|m| &m[..])
+    }
+}
+
 impl From<&OpenedFile> for FileMeta {
     fn from(f: &OpenedFile) -> Self {
         FileMeta {
@@ -69,6 +88,8 @@ pub struct AppState {
     /// 统计分析代数：同上
     analysis_gen: Arc<AtomicU64>,
     sys: Mutex<System>,
+    /// 版本存储全局锁：防止并发记录/删除/清理导致 meta.json 竞写
+    versions_lock: Arc<Mutex<()>>,
 }
 
 impl AppState {
@@ -78,6 +99,7 @@ impl AppState {
             search_gen: Arc::new(AtomicU64::new(0)),
             analysis_gen: Arc::new(AtomicU64::new(0)),
             sys: Mutex::new(System::new()),
+            versions_lock: Arc::new(Mutex::new(())),
         }
     }
 }
@@ -719,7 +741,14 @@ pub fn run() {
             search,
             cancel_search,
             analyze_file,
-            get_perf
+            get_perf,
+            versions::list_versions,
+            versions::save_version,
+            versions::load_version_diff,
+            versions::delete_version,
+            versions::rename_version,
+            versions::cleanup_versions,
+            versions::versions_global_size
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

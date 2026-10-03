@@ -47,6 +47,8 @@ interface HexViewerProps {
   onEditStart: (offset: number) => void;
   onEditCommit: (offset: number, oldValue: number, newValue: number) => void;
   onEditCancel: () => void;
+  /** 预览历史版本等只读场景：禁用双击进入直接编辑 */
+  readOnly?: boolean;
 }
 
 interface RowProps {
@@ -348,6 +350,7 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
     onEditStart,
     onEditCommit,
     onEditCancel,
+    readOnly = false,
   },
   ref,
 ) {
@@ -531,15 +534,15 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
     [offsetFromEvent, selection, onSelectionChange, onCursorChange],
   );
 
-  /** 直接编辑模式：双击字节进入行内编辑 */
+  /** 直接编辑模式：双击字节进入行内编辑（预览历史版本时禁用） */
   const handleDoubleClick = useCallback(
     (e: React.MouseEvent) => {
-      if (editMode !== 'direct') return;
+      if (readOnly || editMode !== 'direct') return;
       const off = offsetFromEvent(e);
       if (off === null) return;
       onEditStart(off);
     },
-    [editMode, offsetFromEvent, onEditStart],
+    [readOnly, editMode, offsetFromEvent, onEditStart],
   );
 
   const handleMouseMove = useCallback(

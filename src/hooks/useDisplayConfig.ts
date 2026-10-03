@@ -1,5 +1,12 @@
 import { useCallback, useEffect, useState } from 'react';
-import type { BytesPerRow, DisplayConfig, EditMode, TextEncoding, ThemeName } from '../types';
+import type {
+  BytesPerRow,
+  DisplayConfig,
+  EditMode,
+  TextEncoding,
+  ThemeName,
+  VersionMode,
+} from '../types';
 import { ENCODING_VALUES } from '../utils/decode';
 
 const STORAGE_KEY = 'hex-viewer-config-v1';
@@ -12,6 +19,7 @@ const DEFAULT_CONFIG: DisplayConfig = {
   encoding: 'ascii',
   editMode: 'dialog',
   confirmSave: false,
+  versionMode: 'auto',
 };
 
 function loadConfig(): DisplayConfig {
@@ -39,6 +47,9 @@ function loadConfig(): DisplayConfig {
         : DEFAULT_CONFIG.editMode,
       confirmSave:
         typeof parsed.confirmSave === 'boolean' ? parsed.confirmSave : DEFAULT_CONFIG.confirmSave,
+      versionMode: (['auto', 'manual'] as VersionMode[]).includes(parsed.versionMode as VersionMode)
+        ? (parsed.versionMode as VersionMode)
+        : DEFAULT_CONFIG.versionMode,
     };
   } catch {
     return DEFAULT_CONFIG;
@@ -92,6 +103,10 @@ export function useDisplayConfig() {
     setConfig(c => ({ ...c, confirmSave }));
   }, []);
 
+  const setVersionMode = useCallback((versionMode: VersionMode) => {
+    setConfig(c => ({ ...c, versionMode }));
+  }, []);
+
   return {
     config,
     setBytesPerRow,
@@ -102,5 +117,6 @@ export function useDisplayConfig() {
     setEncoding,
     setEditMode,
     setConfirmSave,
+    setVersionMode,
   };
 }

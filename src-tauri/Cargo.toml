@@ -26,6 +26,8 @@ tauri-plugin-dialog = "2.8.0"
 memmap2 = "0.9.11"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 memchr = "2.8.3"
+sha2 = "0.10"
+zstd = "0.13"
 
 
 # Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration

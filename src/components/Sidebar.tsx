@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import type { Bookmark, EditMode, FileMeta, SidebarTab } from '../types';
 import type { StatsState } from '../hooks/useFileStats';
 import type { SearchState } from '../hooks/useFileSearch';
@@ -49,6 +50,10 @@ interface SidebarProps {
   pos: number;
   onEditSelection: () => void;
   onDiscardAll: () => void;
+  /** 历史版本区块（嵌入编辑选项卡） */
+  versionsSlot?: ReactNode;
+  /** 预览历史版本中：编辑选项卡锁定为只读 */
+  previewActive: boolean;
   // 性能（公共底部）
   perf: PerfState;
   cacheBytes: number;
@@ -92,6 +97,8 @@ export function Sidebar(props: SidebarProps) {
     pos,
     onEditSelection,
     onDiscardAll,
+    versionsSlot,
+    previewActive,
     perf,
     cacheBytes,
     visibleRows,
@@ -170,6 +177,7 @@ export function Sidebar(props: SidebarProps) {
             onRemoveBookmark={onRemoveBookmark}
             onUpdateBookmark={onUpdateBookmark}
             onClearBookmarks={onClearBookmarks}
+            readOnly={previewActive}
           />
         </div>
         <div className="sidebar-pane" style={{ display: activeTab === 'search' ? 'block' : 'none' }}>
@@ -193,6 +201,8 @@ export function Sidebar(props: SidebarProps) {
             pos={pos}
             onEditSelection={onEditSelection}
             onDiscardAll={onDiscardAll}
+            versionsSlot={versionsSlot}
+            locked={previewActive}
           />
         </div>
       </div>

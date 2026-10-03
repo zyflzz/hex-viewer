@@ -14,8 +14,17 @@ import { useFileSearch, type SearchMode } from './hooks/useFileSearch';
 import { useFileStats } from './hooks/useFileStats';
 import { usePerfMonitor } from './hooks/usePerfMonitor';
 import { useFileBookmarks } from './hooks/useFileBookmarks';
+import { useFileVersions, type CleanupOptions } from './hooks/useFileVersions';
+import { SidebarVersions } from './components/SidebarVersions';
 import type { Bookmark, FileMeta, Selection, SidebarTab, TextEncoding } from './types';
-import { hexByte, hexOffset, offsetDigits, parseOffsetInput } from './utils/format';
+import {
+  fmtVersionTime,
+  hexByte,
+  hexOffset,
+  makeVersionLabel,
+  offsetDigits,
+  parseOffsetInput,
+} from './utils/format';
 import { decodeBytesToText, encodingLabel } from './utils/decode';
 import './App.css';
 
@@ -46,6 +55,7 @@ function App() {
     setEncoding,
     setEditMode,
     setConfirmSave,
+    setVersionMode,
   } = useDisplayConfig();
   const {
     fileMeta,
@@ -64,6 +74,7 @@ function App() {
   const perf = usePerfMonitor(true);
   const bm = useFileBookmarks(fileMeta);
   const edit = useFileEdits(fileMeta);
+  const ver = useFileVersions(fileMeta, edit);
 
   const hexViewerRef = useRef<HexViewerHandle>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -101,6 +112,8 @@ function App() {
   const [discardConfirmOpen, setDiscardConfirmOpen] = useState(false);
   /** 待确认的"撤销到指定操作"目标索引（操作记录中撤销早期操作需二次确认） */
   const [undoConfirmIndex, setUndoConfirmIndex] = useState<number | null>(null);
+  /** 待确认的"恢复历史版本"目标版本 */
+  const [restoreConfirmId, setRestoreConfirmId] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
 
   const [toast, setToast] = useState<string | null>(null);
@@ -159,6 +172,8 @@ function App() {
       });
       if (!selected) return;
       const path = selected as string;
+      // 预览不改动真实状态：先退出，未保存判断与保存路径不受预览影响
+      ver.exitPreview();
       if (edit.editCount > 0) {
         setUnsavedAction({ kind: 'open', path });
         return;
@@ -168,16 +183,17 @@ function App() {
       showToast(`打开文件失败: ${err}`);
       console.error(err);
     }
-  }, [edit.editCount, performOpen, showToast]);
+  }, [edit.editCount, ver, performOpen, showToast]);
 
   const handleCloseFile = useCallback(() => {
     if (!fileMeta) return;
+    ver.exitPreview();
     if (edit.editCount > 0) {
       setUnsavedAction({ kind: 'close', path: null });
       return;
     }
     performClose();
-  }, [fileMeta, edit.editCount, performClose]);
+  }, [fileMeta, edit.editCount, ver, performClose]);
 
   /** 未保存确认后执行挂起的打开/关闭动作 */
   const proceedUnsaved = useCallback(
@@ -274,6 +290,12 @@ function App() {
     search.runSearch(searchMode, searchText, caseSensitive);
   }, [search, searchMode, searchText, caseSensitive]);
 
+  /** 显示用覆盖层：预览历史版本时为临时覆盖层（版本内容），否则为真实编辑覆盖层 */
+  const displayEdits = useMemo(
+    () => ver.previewOverlay ?? edit.edits,
+    [ver.previewOverlay, edit.edits],
+  );
+
   /** 复制选中字节（Hex / 按指定编码解码的文本） */
   const copySelection = useCallback(
     async (mode: 'hex' | 'text', encoding: TextEncoding = config.encoding) => {
@@ -285,9 +307,9 @@ function App() {
       }
       try {
         const data = await readRange(selection.start, len);
-        // 应用编辑覆盖层：复制内容与视图所见一致
+        // 应用显示覆盖层：复制内容与视图所见一致（含版本预览）
         for (let i = 0; i < data.length; i++) {
-          const v = edit.edits.get(selection.start + i);
+          const v = displayEdits.get(selection.start + i);
           if (v !== undefined) data[i] = v;
         }
         let text: string;
@@ -305,20 +327,20 @@ function App() {
         showToast('复制失败');
       }
     },
-    [selection, readRange, showToast, config.encoding, edit.edits],
+    [selection, readRange, showToast, config.encoding, displayEdits],
   );
 
   // ---------- 编辑：覆盖层应用 / 保存 / 编辑入口 ----------
 
-  /** 应用编辑覆盖层的字节读取：无编辑零拷贝；仅含编辑的行拷贝替换（行宽 ≤32，常数开销） */
+  /** 应用显示覆盖层的字节读取：无覆盖零拷贝；仅含覆盖的行拷贝替换（行宽 ≤32，常数开销） */
   const displayGetBytes = useCallback(
     (offset: number, len: number): Uint8Array | null => {
       const raw = getBytes(offset, len);
       if (!raw) return null;
-      if (edit.edits.size === 0) return raw;
+      if (displayEdits.size === 0) return raw;
       let has = false;
       for (let i = 0; i < raw.length; i++) {
-        if (edit.edits.has(offset + i)) {
+        if (displayEdits.has(offset + i)) {
           has = true;
           break;
         }
@@ -327,12 +349,12 @@ function App() {
       const out = new Uint8Array(raw.length);
       out.set(raw);
       for (let i = 0; i < out.length; i++) {
-        const v = edit.edits.get(offset + i);
+        const v = displayEdits.get(offset + i);
         if (v !== undefined) out[i] = v;
       }
       return out;
     },
-    [getBytes, edit.edits],
+    [getBytes, displayEdits],
   );
 
   /** 覆盖层 → 后端保存载荷（offset + 新字节值） */
@@ -348,6 +370,10 @@ function App() {
       showToast('文件为只读，请改用另存为（Ctrl+Shift+S）');
       return false;
     }
+    if (ver.previewing) {
+      showToast('预览历史版本中，请先返回当前内容');
+      return false;
+    }
     if (saving) return false;
     setSaving(true);
     try {
@@ -359,6 +385,10 @@ function App() {
       const rb = config.bytesPerRow;
       ensureRange(visibleRange.first * rb, (visibleRange.last + 1) * rb - 1);
       showToast('已保存');
+      // 自动模式：保存成功后记录一个版本（只读文件不记录；与最新版本相同则静默跳过）
+      if (config.versionMode === 'auto' && !meta.is_readonly) {
+        ver.recordVersion(makeVersionLabel('自动')).catch(err => console.error(err));
+      }
       return true;
     } catch (err) {
       showToast(`保存失败: ${err}`);
@@ -375,13 +405,19 @@ function App() {
     resetChunks,
     showToast,
     config.bytesPerRow,
+    config.versionMode,
     ensureRange,
     visibleRange,
+    ver,
   ]);
 
   /** 另存为：写目标路径，当前文件与覆盖层均保持不变 */
   const doSaveAs = useCallback(async () => {
     if (!fileMeta || saving) return;
+    if (ver.previewing) {
+      showToast('预览历史版本中，请先返回当前内容');
+      return;
+    }
     try {
       const target = await saveFileDialog({ defaultPath: fileMeta.path });
       if (!target) return;
@@ -389,13 +425,17 @@ function App() {
       await invoke<FileMeta>('save_file', { changes: changesPayload, path: target });
       const name = (target as string).split(/[\\/]/).pop() ?? '新文件';
       showToast(`已另存为 ${name}`);
+      // 自动模式：另存为成功同样记录当前内容为一个版本
+      if (config.versionMode === 'auto' && !fileMeta.is_readonly) {
+        ver.recordVersion(makeVersionLabel('自动')).catch(err => console.error(err));
+      }
     } catch (err) {
       showToast(`另存为失败: ${err}`);
       console.error(err);
     } finally {
       setSaving(false);
     }
-  }, [fileMeta, changesPayload, saving, showToast]);
+  }, [fileMeta, changesPayload, saving, config.versionMode, ver, showToast]);
 
   /** Ctrl+S：可选保存前确认 */
   const handleSaveShortcut = useCallback(() => {
@@ -408,6 +448,7 @@ function App() {
   const handleEditStart = useCallback(
     (offset: number) => {
       if (!fileMeta) return;
+      if (ver.previewing) return;
       if (fileMeta.is_readonly) {
         showToast('文件为只读，无法编辑（可另存为）');
         return;
@@ -416,7 +457,7 @@ function App() {
       setCursorOffset(offset);
       setSelection({ start: offset, end: offset });
     },
-    [fileMeta, showToast],
+    [fileMeta, ver.previewing, showToast],
   );
 
   /**
@@ -426,6 +467,10 @@ function App() {
    */
   const startEdit = useCallback(() => {
     if (!fileMeta || fileMeta.size === 0) return;
+    if (ver.previewing) {
+      showToast('预览历史版本中，请先返回当前内容');
+      return;
+    }
     if (fileMeta.is_readonly) {
       showToast('文件为只读，无法编辑（可另存为）');
       return;
@@ -445,7 +490,7 @@ function App() {
       (cursorOffset !== null ? { start: cursorOffset, end: cursorOffset } : null);
     if (!range) return;
     setEditDialogRange(range);
-  }, [fileMeta, config.editMode, cursorOffset, selection, handleEditStart, showToast]);
+  }, [fileMeta, config.editMode, cursorOffset, selection, handleEditStart, ver.previewing, showToast]);
 
   const handleEditCommit = useCallback(
     (offset: number, oldValue: number, newValue: number) => {
@@ -528,6 +573,90 @@ function App() {
     [edit],
   );
 
+  // ---------- 历史版本：记录 / 预览 / 恢复 / 删除 / 重命名 / 清理 ----------
+
+  /** 手动记录当前内容为一个版本 */
+  const handleManualRecord = useCallback(async () => {
+    try {
+      const saved = await ver.recordVersion(makeVersionLabel('手动'));
+      showToast(saved ? '已记录版本' : '与最新版本相同，已跳过');
+    } catch (err) {
+      showToast(`记录版本失败: ${err}`);
+      console.error(err);
+    }
+  }, [ver, showToast]);
+
+  const handleTogglePreview = useCallback(
+    async (id: string) => {
+      try {
+        await ver.togglePreview(id);
+      } catch (err) {
+        showToast(`载入版本失败: ${err}`);
+        console.error(err);
+      }
+    },
+    [ver, showToast],
+  );
+
+  const handleDeleteVersion = useCallback(
+    async (id: string) => {
+      try {
+        await ver.deleteVersionById(id);
+      } catch (err) {
+        showToast(`删除版本失败: ${err}`);
+        console.error(err);
+      }
+    },
+    [ver, showToast],
+  );
+
+  const handleRenameVersion = useCallback(
+    async (id: string, label: string) => {
+      try {
+        await ver.renameVersionById(id, label);
+      } catch (err) {
+        showToast(`重命名失败: ${err}`);
+        console.error(err);
+      }
+    },
+    [ver, showToast],
+  );
+
+  const handleCleanupVersions = useCallback(
+    async (opts: CleanupOptions) => {
+      try {
+        const n = await ver.cleanupVersions(opts);
+        showToast(n > 0 ? `已清理 ${n} 个版本` : '没有需要清理的版本');
+      } catch (err) {
+        showToast(`清理失败: ${err}`);
+        console.error(err);
+      }
+    },
+    [ver, showToast],
+  );
+
+  /** 恢复确认后执行：版本差异作为一个新编辑操作追加（可 Ctrl+Z 撤销） */
+  const doRestoreVersion = useCallback(
+    async (id: string) => {
+      try {
+        const { changes, skipped } = await ver.restoreVersion(id);
+        if (changes === 0) {
+          showToast(skipped > 0 ? `版本位置超出当前文件，已跳过 ${skipped} 处` : '当前内容与该版本一致');
+        } else {
+          showToast(
+            skipped > 0
+              ? `已恢复 ${changes} 字节（另有 ${skipped} 处超出文件已跳过）`
+              : `已恢复 ${changes} 字节（可撤销）`,
+          );
+        }
+      } catch (err) {
+        showToast(`恢复版本失败: ${err}`);
+        console.error(err);
+      }
+    },
+    [ver, showToast],
+  );
+
   const handleVisibleRangeChange = useCallback(
     (startByte: number, endByte: number) => {
       ensureRange(startByte, endByte);
@@ -584,8 +713,16 @@ function App() {
           unsavedAction ||
           saveConfirmOpen ||
           discardConfirmOpen ||
-          undoConfirmIndex !== null
+          undoConfirmIndex !== null ||
+          restoreConfirmId !== null
         ) {
+          return;
+        }
+        // 其他 portal 弹窗（如版本清理对话框）打开时，Escape 由弹窗自行处理
+        if (document.querySelector('.modal')) return;
+        // 预览历史版本：Escape 先退出预览
+        if (ver.previewing) {
+          ver.exitPreview();
           return;
         }
         if (directEditOffset !== null) {
@@ -596,11 +733,12 @@ function App() {
         (document.activeElement as HTMLElement | null)?.blur?.();
       } else if (ctrl && key === 'c' && !inInput && selection) {
         e.preventDefault();
-        // Ctrl+C 复制 Hex，Ctrl+Shift+C 按当前显示编码复制文本
+        // Ctrl+C 复制 Hex，Ctrl+Shift+C 按当前显示编码复制文本（预览中同样可用）
         copySelection(e.shiftKey ? 'text' : 'hex');
       } else if (ctrl && key === 'b' && !inInput) {
-        // Ctrl+B 切换光标处书签；Ctrl+Shift+B 把选择转成标记
+        // Ctrl+B 切换光标处书签；Ctrl+Shift+B 把选择转成标记（预览中禁用）
         e.preventDefault();
+        if (ver.previewing) return;
         if (e.shiftKey) {
           addMarkFromSelection();
         } else if (cursorOffset !== null && fileMeta && cursorOffset < fileMeta.size) {
@@ -611,13 +749,18 @@ function App() {
         e.preventDefault();
         jumpBookmarkRelative(e.shiftKey ? -1 : 1);
       } else if (ctrl && key === 's' && !inInput) {
-        // Ctrl+S 保存（可配置确认），Ctrl+Shift+S 另存为
+        // Ctrl+S 保存（可配置确认），Ctrl+Shift+S 另存为；预览中禁用
         e.preventDefault();
+        if (ver.previewing) {
+          showToast('预览历史版本中，请先返回当前内容');
+          return;
+        }
         if (e.shiftKey) void doSaveAs();
         else handleSaveShortcut();
       } else if (ctrl && (key === 'z' || key === 'y') && !inInput) {
-        // Ctrl+Z 撤销最近一次，Ctrl+Y / Ctrl+Shift+Z 恢复最近一次
+        // Ctrl+Z 撤销最近一次，Ctrl+Y / Ctrl+Shift+Z 恢复最近一次；预览中禁用
         e.preventDefault();
+        if (ver.previewing) return;
         if (key === 'y' || e.shiftKey) edit.redoLast();
         else edit.undoLast();
       } else if (ctrl && key === 'e' && !inInput) {
@@ -632,6 +775,7 @@ function App() {
           !saveConfirmOpen &&
           !discardConfirmOpen &&
           undoConfirmIndex === null &&
+          restoreConfirmId === null &&
           directEditOffset === null
         ) {
           e.preventDefault();
@@ -655,11 +799,14 @@ function App() {
     saveConfirmOpen,
     discardConfirmOpen,
     undoConfirmIndex,
+    restoreConfirmId,
     directEditOffset,
     doSaveAs,
     handleSaveShortcut,
     edit,
     startEdit,
+    ver,
+    showToast,
   ]);
 
   // 清理计时器
@@ -709,6 +856,33 @@ function App() {
 
       <div className="main-content">
         <main className="hex-display">
+          {ver.previewVersion && fileMeta && (
+            <div className="preview-banner" role="status">
+              <span className="preview-banner-text">
+                正在预览历史版本：<strong>{ver.previewVersion.label}</strong>
+                <span className="preview-banner-time">
+                  {' '}
+                  · {fmtVersionTime(ver.previewVersion.time)}
+                </span>
+              </span>
+              <span className="preview-banner-flex" />
+              <button
+                className="btn mini"
+                disabled={fileMeta.is_readonly}
+                title={
+                  fileMeta.is_readonly
+                    ? '文件为只读，无法恢复'
+                    : '把该版本内容恢复为未保存修改（可撤销）'
+                }
+                onClick={() => ver.previewId && setRestoreConfirmId(ver.previewId)}
+              >
+                恢复到此版本
+              </button>
+              <button className="btn mini" onClick={ver.exitPreview}>
+                返回当前
+              </button>
+            </div>
+          )}
           {fileMeta ? (
             <HexViewer
               key={`${fileMeta.path}::${fileMeta.size}`}
@@ -727,12 +901,13 @@ function App() {
               flashOffset={flashOffset}
               onZoom={zoomFont}
               bookmarks={bm.sorted}
-              edits={edit.edits}
+              edits={displayEdits}
               editMode={config.editMode}
               editTarget={directEditOffset}
               onEditStart={handleEditStart}
               onEditCommit={handleEditCommit}
               onEditCancel={handleEditCancel}
+              readOnly={ver.previewing}
             />
           ) : (
             <div className="hex-viewer hex-viewer-empty">
@@ -784,6 +959,27 @@ function App() {
           pos={edit.pos}
           onEditSelection={startEdit}
           onDiscardAll={() => setDiscardConfirmOpen(true)}
+          versionsSlot={
+            fileMeta && fileMeta.size > 0 ? (
+              <SidebarVersions
+                mode={config.versionMode}
+                onModeChange={setVersionMode}
+                versions={ver.versions}
+                previewId={ver.previewId}
+                previewActive={ver.previewing}
+                readonly={!!fileMeta.is_readonly}
+                overLimit={ver.overLimit}
+                globalSize={ver.globalSize}
+                onRecord={handleManualRecord}
+                onTogglePreview={handleTogglePreview}
+                onRestore={setRestoreConfirmId}
+                onDelete={handleDeleteVersion}
+                onRename={handleRenameVersion}
+                onCleanup={handleCleanupVersions}
+              />
+            ) : undefined
+          }
+          previewActive={ver.previewing}
           perf={perf}
           cacheBytes={cacheBytes}
           visibleRows={visibleRows}
@@ -924,6 +1120,33 @@ function App() {
           onCancel={() => setUndoConfirmIndex(null)}
         />
       )}
+
+      {/* 恢复历史版本确认 */}
+      {restoreConfirmId !== null &&
+        ver.versions.find(v => v.id === restoreConfirmId) &&
+        fileMeta && (
+          <ConfirmDialog
+            title="恢复历史版本"
+            message={`将把版本「${ver.versions.find(v => v.id === restoreConfirmId)!.label}」的内容应用到当前文件（作为未保存修改，可撤销），当前的未保存修改会被覆盖，是否继续？`}
+            buttons={[
+              {
+                label: '恢复',
+                kind: 'primary',
+                onClick: () => {
+                  const id = restoreConfirmId;
+                  setRestoreConfirmId(null);
+                  void doRestoreVersion(id);
+                },
+              },
+              {
+                label: '取消',
+                kind: 'plain',
+                onClick: () => setRestoreConfirmId(null),
+              },
+            ]}
+            onCancel={() => setRestoreConfirmId(null)}
+          />
+        )}
     </div>
   );
 }

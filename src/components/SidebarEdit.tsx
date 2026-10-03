@@ -1,3 +1,4 @@
+import type { ReactNode } from 'react';
 import type { EditMode, FileMeta } from '../types';
 import type { EditOp } from '../hooks/useFileEdits';
 
@@ -29,6 +30,10 @@ interface SidebarEditProps {
   onEditSelection: () => void;
   /** 放弃全部未保存修改（App 层弹确认） */
   onDiscardAll: () => void;
+  /** 历史版本区块（渲染于快捷键说明与操作记录之间） */
+  versionsSlot?: ReactNode;
+  /** 预览历史版本中：禁用编辑/撤销/恢复/放弃 */
+  locked?: boolean;
 }
 
 function fmtTime(t: number): string {
@@ -57,6 +62,8 @@ export function SidebarEdit({
   pos,
   onEditSelection,
   onDiscardAll,
+  versionsSlot,
+  locked = false,
 }: SidebarEditProps) {
   const hasFile = !!meta && meta.size > 0;
   const readonly = !!meta?.is_readonly;
@@ -114,18 +121,23 @@ export function SidebarEdit({
           <div className="edit-btns">
             <button
               className="btn mini"
-              disabled={readonly}
+              disabled={readonly || locked}
               onClick={onEditSelection}
               title="按当前模式编辑光标/选中区间（Enter / Ctrl+E）"
             >
               开始编辑
             </button>
-            <button className="btn mini" disabled={!canUndo} onClick={onUndo} title="撤销最近一次（Ctrl+Z）">
+            <button
+              className="btn mini"
+              disabled={!canUndo || locked}
+              onClick={onUndo}
+              title="撤销最近一次（Ctrl+Z）"
+            >
               撤销
             </button>
             <button
               className="btn mini"
-              disabled={!canRedo}
+              disabled={!canRedo || locked}
               onClick={onRedo}
               title="恢复最近一次（Ctrl+Shift+Z / Ctrl+Y）"
             >
@@ -133,7 +145,7 @@ export function SidebarEdit({
             </button>
             <button
               className="btn mini danger"
-              disabled={editCount === 0}
+              disabled={editCount === 0 || locked}
               onClick={onDiscardAll}
               title="放弃全部未保存修改（不可恢复）"
             >
@@ -148,6 +160,8 @@ export function SidebarEdit({
             <br />
             撤销早期操作会一并撤销其后的操作（需确认）；撤销后继续编辑将放弃被撤销的分支
           </p>
+
+          {versionsSlot}
 
           <div className="edit-log-head">
             <span>操作记录</span>

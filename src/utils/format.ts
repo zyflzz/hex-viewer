@@ -18,6 +18,21 @@ export function formatDateTime(unixSec: number): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
 }
 
+/** 版本记录时刻（unix 毫秒）→ 简短展示：MM-DD HH:mm */
+export function fmtVersionTime(unixMs: number): string {
+  if (!unixMs) return '-';
+  const d = new Date(unixMs);
+  const p = (x: number) => String(x).padStart(2, '0');
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+/** 生成版本默认标签：`自动 · 2026-10-04 08:30` / `手动 · …` */
+export function makeVersionLabel(prefix: '自动' | '手动'): string {
+  const d = new Date();
+  const p = (x: number) => String(x).padStart(2, '0');
+  return `${prefix} · ${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
 const HEX = Array.from({ length: 256 }, (_, i) => i.toString(16).padStart(2, '0').toUpperCase());
 
 export function hexByte(b: number): string {

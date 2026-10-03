@@ -9,6 +9,7 @@ function BookmarkItem({
   active,
   invalid,
   digits,
+  readOnly = false,
   onUpdate,
   onRemove,
   onJump,
@@ -17,6 +18,8 @@ function BookmarkItem({
   active: boolean;
   invalid: boolean;
   digits: number;
+  /** 预览历史版本等只读场景：禁改色/命名/删除，跳转可用 */
+  readOnly?: boolean;
   onUpdate: (id: string, patch: Partial<Omit<Bookmark, 'id'>>) => void;
   onRemove: (id: string) => void;
   onJump: () => void;
@@ -56,7 +59,8 @@ function BookmarkItem({
         <button
           className="bm-color"
           style={{ background: bm.color }}
-          title="更改颜色"
+          title={readOnly ? '预览历史版本中' : '更改颜色'}
+          disabled={readOnly}
           onClick={() => setPaletteOpen(true)}
         />
       )}
@@ -84,6 +88,7 @@ function BookmarkItem({
           className="bm-name"
           title={bm.name || undefined}
           onClick={() => {
+            if (readOnly) return;
             setDraft(bm.name);
             setEditing(true);
           }}
@@ -91,7 +96,12 @@ function BookmarkItem({
           {bm.name || '未命名'}
         </span>
       )}
-      <button className="bm-del" title="删除" onClick={() => onRemove(bm.id)}>
+      <button
+        className="bm-del"
+        title={readOnly ? '预览历史版本中' : '删除'}
+        disabled={readOnly}
+        onClick={() => onRemove(bm.id)}
+      >
         ×
       </button>
     </li>
@@ -112,6 +122,8 @@ interface SidebarBookmarksProps {
   onRemoveBookmark: (id: string) => void;
   onUpdateBookmark: (id: string, patch: Partial<Omit<Bookmark, 'id'>>) => void;
   onClearBookmarks: () => void;
+  /** 预览历史版本等只读场景：禁增删改，跳转可用 */
+  readOnly?: boolean;
 }
 
 /** "书签"选项卡：书签与标记列表（点/区间混排，按偏移排序） */
@@ -128,6 +140,7 @@ export function SidebarBookmarks({
   onRemoveBookmark,
   onUpdateBookmark,
   onClearBookmarks,
+  readOnly = false,
 }: SidebarBookmarksProps) {
   const digits = meta ? offsetDigits(meta.size) : 8;
   const hasFile = !!meta && meta.size > 0;
@@ -144,24 +157,24 @@ export function SidebarBookmarks({
         <div className="bm-actions">
           <button
             className="btn mini"
-            disabled={cursorOffset === null}
-            title="在光标处添加/删除书签（Ctrl+B）"
+            disabled={readOnly || cursorOffset === null}
+            title={readOnly ? '预览历史版本中' : '在光标处添加/删除书签（Ctrl+B）'}
             onClick={() => cursorOffset !== null && onToggleBookmark(cursorOffset)}
           >
             书签
           </button>
           <button
             className="btn mini"
-            disabled={!hasSelection}
-            title="把当前选择转成标记（Ctrl+Shift+B）"
+            disabled={readOnly || !hasSelection}
+            title={readOnly ? '预览历史版本中' : '把当前选择转成标记（Ctrl+Shift+B）'}
             onClick={onAddMark}
           >
             标记
           </button>
           <button
             className="btn mini danger"
-            disabled={bookmarks.length === 0}
-            title="清空当前文件的全部书签与标记"
+            disabled={readOnly || bookmarks.length === 0}
+            title={readOnly ? '预览历史版本中' : '清空当前文件的全部书签与标记'}
             onClick={onClearBookmarks}
           >
             清空
@@ -185,6 +198,7 @@ export function SidebarBookmarks({
               active={bm.id === activeBookmarkId}
               invalid={bm.start >= (meta?.size ?? 0)}
               digits={digits}
+              readOnly={readOnly}
               onUpdate={onUpdateBookmark}
               onRemove={onRemoveBookmark}
               onJump={() => onJumpToBookmark(bm)}

@@ -49,6 +49,9 @@ export type SidebarTab = 'info' | 'bookmarks' | 'search' | 'edit';
 /** 编辑输入模式：对话框（Ctrl+E）/ 直接（双击字节原地编辑） */
 export type EditMode = 'dialog' | 'direct';
 
+/** 历史版本记录模式：保存时自动记录 / 手动按钮记录 */
+export type VersionMode = 'auto' | 'manual';
+
 export type BytesPerRow = 8 | 16 | 32;
 
 /** 右侧栏文本编码 */
@@ -64,6 +67,8 @@ export interface DisplayConfig {
   editMode: EditMode;
   /** 保存前二次确认 */
   confirmSave: boolean;
+  /** 历史版本记录模式（保存时自动 / 手动） */
+  versionMode: VersionMode;
 }
 
 /** 字节级选择（含首尾） */

@@ -959,26 +959,25 @@ function App() {
           pos={edit.pos}
           onEditSelection={startEdit}
           onDiscardAll={() => setDiscardConfirmOpen(true)}
-          versionsSlot={
-            fileMeta && fileMeta.size > 0 ? (
-              <SidebarVersions
-                mode={config.versionMode}
-                onModeChange={setVersionMode}
-                versions={ver.versions}
-                previewId={ver.previewId}
-                previewActive={ver.previewing}
-                readonly={!!fileMeta.is_readonly}
-                overLimit={ver.overLimit}
-                globalSize={ver.globalSize}
-                onRecord={handleManualRecord}
-                onTogglePreview={handleTogglePreview}
-                onRestore={setRestoreConfirmId}
-                onDelete={handleDeleteVersion}
-                onRename={handleRenameVersion}
-                onCleanup={handleCleanupVersions}
-              />
-            ) : undefined
+          versionsPane={
+            <SidebarVersions
+              meta={fileMeta}
+              mode={config.versionMode}
+              onModeChange={setVersionMode}
+              versions={ver.versions}
+              previewId={ver.previewId}
+              previewActive={ver.previewing}
+              overLimit={ver.overLimit}
+              globalSize={ver.globalSize}
+              onRecord={handleManualRecord}
+              onTogglePreview={handleTogglePreview}
+              onRestore={setRestoreConfirmId}
+              onDelete={handleDeleteVersion}
+              onRename={handleRenameVersion}
+              onCleanup={handleCleanupVersions}
+            />
           }
+          versionsCount={ver.versions.length}
           previewActive={ver.previewing}
           perf={perf}
           cacheBytes={cacheBytes}

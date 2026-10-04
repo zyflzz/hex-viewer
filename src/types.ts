@@ -44,7 +44,7 @@ export interface PerfInfo {
 export type ThemeName = 'dark' | 'light' | 'contrast';
 
 /** 侧栏选项卡 */
-export type SidebarTab = 'info' | 'bookmarks' | 'search' | 'edit';
+export type SidebarTab = 'info' | 'bookmarks' | 'search' | 'edit' | 'versions';
 
 /** 编辑输入模式：对话框（Ctrl+E）/ 直接（双击字节原地编辑） */
 export type EditMode = 'dialog' | 'direct';

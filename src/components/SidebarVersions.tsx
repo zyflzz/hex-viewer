@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { createPortal } from 'react-dom';
-import type { VersionMode } from '../types';
+import type { FileMeta, VersionMode } from '../types';
 import type { CleanupOptions, VersionMeta } from '../hooks/useFileVersions';
 import { formatBytes, formatNumber, fmtVersionTime } from '../utils/format';
 
@@ -100,14 +100,13 @@ function VersionItem({
 }
 
 interface SidebarVersionsProps {
+  meta: FileMeta | null;
   mode: VersionMode;
   onModeChange: (m: VersionMode) => void;
   versions: VersionMeta[];
   previewId: string | null;
   /** 处于任一版本预览中（禁记录） */
   previewActive: boolean;
-  /** 文件只读 */
-  readonly: boolean;
   overLimit: boolean;
   globalSize: number;
   /** 手动记录当前状态为一个版本 */
@@ -122,14 +121,14 @@ interface SidebarVersionsProps {
 
 type CleanMode = 'count' | 'days' | 'all';
 
-/** "历史版本"区块：记录模式 / 版本列表 / 清理（嵌入编辑选项卡，位于未保存修改与操作记录之间） */
+/** "历史版本"选项卡：记录模式 / 版本列表 / 清理（独立于操作记录） */
 export function SidebarVersions({
+  meta,
   mode,
   onModeChange,
   versions,
   previewId,
   previewActive,
-  readonly,
   overLimit,
   globalSize,
   onRecord,
@@ -139,6 +138,8 @@ export function SidebarVersions({
   onRename,
   onCleanup,
 }: SidebarVersionsProps) {
+  const hasFile = !!meta && meta.size > 0;
+  const readonly = !!meta?.is_readonly;
   const [cleanOpen, setCleanOpen] = useState(false);
   const [cleanMode, setCleanMode] = useState<CleanMode>('count');
   const [keepCount, setKeepCount] = useState(20);
@@ -175,81 +176,87 @@ export function SidebarVersions({
   };
 
   return (
-    <>
-      <div className="edit-log-head">
-        <span>历史版本</span>
+    <section className="side-section">
+      <h3>
+        历史版本
         {versions.length > 0 && (
-          <span className="edit-log-count">{formatNumber(versions.length)} 个</span>
+          <span className="side-progress-text">{formatNumber(versions.length)}</span>
         )}
-      </div>
-      <div className="edit-opt">
-        <span className="edit-label">记录模式</span>
-        <div className="seg">
-          <button
-            className={mode === 'auto' ? 'on' : ''}
-            onClick={() => onModeChange('auto')}
-            title="每次成功保存（含另存为）后自动记录一个版本"
-          >
-            保存时自动
-          </button>
-          <button
-            className={mode === 'manual' ? 'on' : ''}
-            onClick={() => onModeChange('manual')}
-            title="仅手动点击「记录版本」时记录"
-          >
-            手动
-          </button>
-        </div>
-      </div>
-      <div className="edit-btns">
-        <button
-          className="btn mini"
-          disabled={readonly || previewActive}
-          title={
-            readonly
-              ? '文件为只读，无法记录版本'
-              : previewActive
-                ? '预览历史版本中，请先返回当前内容'
-                : '把当前内容记录为一个版本'
-          }
-          onClick={onRecord}
-        >
-          记录版本
-        </button>
-        <button
-          className="btn mini danger"
-          disabled={versions.length === 0}
-          title="批量清理旧版本"
-          onClick={() => setCleanOpen(true)}
-        >
-          清理…
-        </button>
-      </div>
-      {overLimit && (
-        <p className="side-error">版本存储已达 {formatBytes(globalSize)}（超过 2 GB），建议清理旧版本</p>
-      )}
-      {versions.length === 0 ? (
-        <p className="edit-log-empty">
-          {mode === 'auto' ? '保存文件后将自动记录版本' : '点击「记录版本」保存当前内容快照'}
-        </p>
+      </h3>
+      {!hasFile ? (
+        <p className="placeholder-text">打开文件后可用</p>
       ) : (
-        <ul className="ver-list">
-          {versions.slice(0, MAX_LIST_ITEMS).map(v => (
-            <VersionItem
-              key={v.id}
-              v={v}
-              previewing={v.id === previewId}
-              readonly={readonly}
-              onTogglePreview={onTogglePreview}
-              onRestore={onRestore}
-              onDelete={onDelete}
-              onRename={onRename}
-            />
-          ))}
-          {versions.length > MAX_LIST_ITEMS && (
-            <li className="bm-more">还有 {formatNumber(versions.length - MAX_LIST_ITEMS)} 条更早版本</li>
+        <>
+          <div className="edit-opt">
+            <span className="edit-label">记录模式</span>
+            <div className="seg">
+              <button
+                className={mode === 'auto' ? 'on' : ''}
+                onClick={() => onModeChange('auto')}
+                title="每次成功保存（含另存为）后自动记录一个版本"
+              >
+                保存时自动
+              </button>
+              <button
+                className={mode === 'manual' ? 'on' : ''}
+                onClick={() => onModeChange('manual')}
+                title="仅手动点击「记录版本」时记录"
+              >
+                手动
+              </button>
+            </div>
+          </div>
+          <div className="edit-btns">
+            <button
+              className="btn mini"
+              disabled={readonly || previewActive}
+              title={
+                readonly
+                  ? '文件为只读，无法记录版本'
+                  : previewActive
+                    ? '预览历史版本中，请先返回当前内容'
+                    : '把当前内容记录为一个版本'
+              }
+              onClick={onRecord}
+            >
+              记录版本
+            </button>
+            <button
+              className="btn mini danger"
+              disabled={versions.length === 0}
+              title="批量清理旧版本"
+              onClick={() => setCleanOpen(true)}
+            >
+              清理…
+            </button>
+          </div>
+          {overLimit && (
+            <p className="side-error">版本存储已达 {formatBytes(globalSize)}（超过 2 GB），建议清理旧版本</p>
           )}
-        </ul>
+          {versions.length === 0 ? (
+            <p className="edit-log-empty">
+              {mode === 'auto' ? '保存文件后将自动记录版本' : '点击「记录版本」保存当前内容快照'}
+            </p>
+          ) : (
+            <ul className="ver-list">
+              {versions.slice(0, MAX_LIST_ITEMS).map(v => (
+                <VersionItem
+                  key={v.id}
+                  v={v}
+                  previewing={v.id === previewId}
+                  readonly={readonly}
+                  onTogglePreview={onTogglePreview}
+                  onRestore={onRestore}
+                  onDelete={onDelete}
+                  onRename={onRename}
+                />
+              ))}
+              {versions.length > MAX_LIST_ITEMS && (
+                <li className="bm-more">还有 {formatNumber(versions.length - MAX_LIST_ITEMS)} 条更早版本</li>
+              )}
+            </ul>
+          )}
+        </>
       )}
 
       {cleanOpen &&
@@ -316,6 +323,6 @@ export function SidebarVersions({
           </div>,
           document.body,
         )}
-    </>
+    </section>
   );
 }

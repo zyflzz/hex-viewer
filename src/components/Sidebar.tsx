@@ -50,8 +50,10 @@ interface SidebarProps {
   pos: number;
   onEditSelection: () => void;
   onDiscardAll: () => void;
-  /** 历史版本区块（嵌入编辑选项卡） */
-  versionsSlot?: ReactNode;
+  /** 历史版本选项卡内容（独立于编辑选项卡） */
+  versionsPane?: ReactNode;
+  /** 历史版本数（标签徽章） */
+  versionsCount: number;
   /** 预览历史版本中：编辑选项卡锁定为只读 */
   previewActive: boolean;
   // 性能（公共底部）
@@ -60,7 +62,7 @@ interface SidebarProps {
   visibleRows: number;
 }
 
-/** 侧栏容器：顶部选项卡栏 + 四个常驻 pane（display 切换保留状态）+ 底部性能监控 */
+/** 侧栏容器：顶部选项卡栏 + 五个常驻 pane（display 切换保留状态）+ 底部性能监控 */
 export function Sidebar(props: SidebarProps) {
   const {
     activeTab,
@@ -97,7 +99,8 @@ export function Sidebar(props: SidebarProps) {
     pos,
     onEditSelection,
     onDiscardAll,
-    versionsSlot,
+    versionsPane,
+    versionsCount,
     previewActive,
     perf,
     cacheBytes,
@@ -157,6 +160,17 @@ export function Sidebar(props: SidebarProps) {
             <span className="tab-badge">{editCount > 99 ? '99+' : editCount}</span>
           )}
         </button>
+        <button
+          className={`sidebar-tab${activeTab === 'versions' ? ' on' : ''}`}
+          role="tab"
+          aria-selected={activeTab === 'versions'}
+          onClick={() => onTabChange('versions')}
+        >
+          版本
+          {versionsCount > 0 && (
+            <span className="tab-badge">{versionsCount > 99 ? '99+' : versionsCount}</span>
+          )}
+        </button>
       </div>
 
       <div className="sidebar-body">
@@ -201,9 +215,14 @@ export function Sidebar(props: SidebarProps) {
             pos={pos}
             onEditSelection={onEditSelection}
             onDiscardAll={onDiscardAll}
-            versionsSlot={versionsSlot}
             locked={previewActive}
           />
+        </div>
+        <div
+          className="sidebar-pane"
+          style={{ display: activeTab === 'versions' ? 'block' : 'none' }}
+        >
+          {versionsPane}
         </div>
       </div>
 

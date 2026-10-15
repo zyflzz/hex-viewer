@@ -15,7 +15,12 @@ import { useFileStats } from './hooks/useFileStats';
 import { usePerfMonitor } from './hooks/usePerfMonitor';
 import { useFileBookmarks } from './hooks/useFileBookmarks';
 import { useFileVersions, type CleanupOptions } from './hooks/useFileVersions';
+import { useAiConfig } from './hooks/useAiConfig';
+import { useAiChat } from './hooks/useAiChat';
+import { streamChat, type ApiChatMessage } from './utils/aiClient';
+import { buildAiContext } from './utils/aiContext';
 import { SidebarVersions } from './components/SidebarVersions';
+import { SidebarAi } from './components/SidebarAi';
 import type { Bookmark, FileMeta, Selection, SidebarTab, TextEncoding } from './types';
 import {
   fmtVersionTime,
@@ -29,6 +34,12 @@ import { decodeBytesToText, encodingLabel } from './utils/decode';
 import './App.css';
 
 const MAX_COPY_BYTES = 4 * 1024 * 1024;
+/** AI 流式请求无响应超时（毫秒），每个增量重置 */
+const AI_TIMEOUT_MS = 60_000;
+/** 单次请求携带的历史消息上限（含当前提问，控制提示词长度） */
+const AI_HISTORY_LIMIT = 20;
+/** 无选中时注入光标附近的字节数 */
+const AI_CURSOR_CONTEXT = 64;
 
 async function writeClipboard(text: string) {
   try {
@@ -75,6 +86,11 @@ function App() {
   const bm = useFileBookmarks(fileMeta);
   const edit = useFileEdits(fileMeta);
   const ver = useFileVersions(fileMeta, edit);
+  const ai = useAiConfig();
+  const aiChat = useAiChat(fileMeta);
+  const [aiGenerating, setAiGenerating] = useState(false);
+  const [aiClearConfirmOpen, setAiClearConfirmOpen] = useState(false);
+  const aiAbortRef = useRef<AbortController | null>(null);
 
   const hexViewerRef = useRef<HexViewerHandle>(null);
   const searchInputRef = useRef<HTMLInputElement>(null);
@@ -657,6 +673,202 @@ function App() {
     [ver, showToast],
   );
 
+  // ---------- AI 助手：上下文构造 / 发送 / 停止（只读，不影响任何编辑状态） ----------
+
+  /**
+   * AI 发送流程：构造数据上下文（选中区间，无选中取光标附近 64 字节）
+   * → 追加用户消息与助手占位 → 流式请求，增量批量刷新。
+   * 所有错误以系统消息形式展示在对话区，不弹窗。
+   */
+  const handleAiSend = useCallback(
+    async (text: string) => {
+      if (aiGenerating || !fileMeta) return;
+      const cfg = ai.config;
+      if (!cfg.model.trim()) {
+        aiChat.appendMessage({ role: 'system', content: '请先在 AI 配置中填写模型名称', isError: true });
+        return;
+      }
+      if (cfg.provider === 'openai' && !cfg.apiKey.trim()) {
+        aiChat.appendMessage({ role: 'system', content: '请先在 AI 配置中填写 API Key', isError: true });
+        return;
+      }
+
+      const fileSize = fileMeta.size;
+      /** 读取光标处字节的显示值（原始内容 + 覆盖层） */
+      const readDisplayByte = async (offset: number): Promise<number | null> => {
+        if (offset < 0 || offset >= fileSize) return null;
+        try {
+          const b = await readRange(offset, 1);
+          return displayEdits.get(offset) ?? b[0];
+        } catch {
+          return null;
+        }
+      };
+
+      let contextText: string | null = null;
+      let contextMeta: { start: number; end: number; truncated: boolean } | undefined;
+
+      try {
+        if (selection) {
+          const len = selection.end - selection.start + 1;
+          const take = Math.min(len, cfg.maxContextBytes);
+          const data = await readRange(selection.start, take);
+          for (let i = 0; i < data.length; i++) {
+            const v = displayEdits.get(selection.start + i);
+            if (v !== undefined) data[i] = v;
+          }
+          contextText = buildAiContext({
+            bytes: data,
+            start: selection.start,
+            fullLength: len,
+            truncated: take < len,
+            title: '选中范围',
+            cursorOffset,
+            cursorByte: await readDisplayByte(cursorOffset ?? -1),
+            fileSize,
+          });
+          contextMeta = { start: selection.start, end: selection.end, truncated: take < len };
+        } else if (cursorOffset !== null && fileSize > 0) {
+          // 无选中：光标前后各半共 64 字节，越界时向文件内收缩
+          const len = Math.min(AI_CURSOR_CONTEXT, fileSize);
+          const start = Math.max(0, Math.min(cursorOffset - (len >> 1), fileSize - len));
+          const data = await readRange(start, len);
+          for (let i = 0; i < data.length; i++) {
+            const v = displayEdits.get(start + i);
+            if (v !== undefined) data[i] = v;
+          }
+          contextText = buildAiContext({
+            bytes: data,
+            start,
+            fullLength: len,
+            truncated: false,
+            title: `光标附近 ${len} 字节`,
+            cursorOffset,
+            cursorByte: data[cursorOffset - start] ?? null,
+            fileSize,
+          });
+          contextMeta = { start, end: start + len - 1, truncated: false };
+        } else {
+          aiChat.appendMessage({
+            role: 'system',
+            content: '请先选择一段字节或点击一个字节设置光标',
+            isError: true,
+          });
+          return;
+        }
+      } catch (err) {
+        console.error(err);
+        aiChat.appendMessage({ role: 'system', content: `读取数据上下文失败: ${err}`, isError: true });
+        return;
+      }
+
+      aiChat.appendMessage({
+        role: 'user',
+        content: text,
+        contextText: contextText ?? undefined,
+        context: contextMeta,
+      });
+
+      // API 消息：系统提示 + 近期对话（系统错误消息不发送；历史用户消息重新拼上其数据上下文）
+      const history = [
+        ...aiChat.messages.filter(m => m.role !== 'system'),
+        { role: 'user' as const, content: text, contextText: contextText ?? undefined },
+      ].slice(-AI_HISTORY_LIMIT);
+      const apiMessages: ApiChatMessage[] = [
+        ...(cfg.systemPrompt.trim() ? [{ role: 'system' as const, content: cfg.systemPrompt }] : []),
+        ...history.map(m => ({
+          role: m.role,
+          content:
+            m.role === 'user' && m.contextText ? `${m.contextText}\n\n[用户提问]\n${m.content}` : m.content,
+        })),
+      ];
+
+      const asstId = aiChat.appendMessage({ role: 'assistant', content: '' });
+      setAiGenerating(true);
+      const controller = new AbortController();
+      aiAbortRef.current = controller;
+
+      // 增量缓冲：30ms 批量刷新，避免每个 token 触发一次渲染
+      let acc = '';
+      let flushTimer: number | null = null;
+      let timedOut = false;
+      let watchdog: number | null = null;
+      const flush = () => {
+        flushTimer = null;
+        aiChat.updateMessage(asstId, acc);
+      };
+      const armWatchdog = () => {
+        if (watchdog !== null) window.clearTimeout(watchdog);
+        watchdog = window.setTimeout(() => {
+          timedOut = true;
+          controller.abort();
+        }, AI_TIMEOUT_MS);
+      };
+
+      try {
+        armWatchdog();
+        await streamChat(
+          cfg,
+          apiMessages,
+          delta => {
+            acc += delta;
+            armWatchdog();
+            if (flushTimer === null) flushTimer = window.setTimeout(flush, 30);
+          },
+          controller.signal,
+        );
+        if (flushTimer !== null) window.clearTimeout(flushTimer);
+        flush();
+        if (!acc) {
+          aiChat.updateMessage(asstId, '[空回复]');
+          console.warn('[AI] 模型返回了空内容');
+        }
+      } catch (err) {
+        if (flushTimer !== null) window.clearTimeout(flushTimer);
+        flush(); // 保留已生成部分
+        if (controller.signal.aborted && !timedOut) {
+          // 用户主动停止：保留已生成内容（首个增量前停止则移除空占位）
+          if (!acc) aiChat.removeMessage(asstId);
+        } else {
+          if (!acc) aiChat.removeMessage(asstId);
+          const reason = timedOut
+            ? '请求超时（60 秒无响应），已中止'
+            : err instanceof Error
+              ? err.message
+              : String(err);
+          aiChat.appendMessage({ role: 'system', content: `AI 请求失败：${reason}`, isError: true });
+        }
+      } finally {
+        if (watchdog !== null) window.clearTimeout(watchdog);
+        aiAbortRef.current = null;
+        setAiGenerating(false);
+      }
+    },
+    [aiGenerating, fileMeta, ai, aiChat, selection, cursorOffset, readRange, displayEdits],
+  );
+
+  /** 停止生成：中止流式请求，保留已生成内容 */
+  const handleAiStop = useCallback(() => {
+    aiAbortRef.current?.abort();
+  }, []);
+
+  /** AI 选项卡徽章：当前会话消息数（用户 + AI 回复） */
+  const aiCount = useMemo(
+    () => aiChat.messages.reduce((n, m) => (m.role === 'system' ? n : n + 1), 0),
+    [aiChat.messages],
+  );
+
+  // 切换文件时中止进行中的 AI 生成（会话按文件隔离，避免流写入其他文件的历史）
+  const aiFilePathRef = useRef<string | null>(null);
+  useEffect(() => {
+    const p = fileMeta?.path ?? null;
+    if (aiGenerating && aiFilePathRef.current !== p) aiAbortRef.current?.abort();
+    aiFilePathRef.current = p;
+  }, [fileMeta, aiGenerating]);
+
+  // 卸载时中止未完成的 AI 请求
+  useEffect(() => () => aiAbortRef.current?.abort(), []);
+
   const handleVisibleRangeChange = useCallback(
     (startByte: number, endByte: number) => {
       ensureRange(startByte, endByte);
@@ -979,6 +1191,22 @@ function App() {
           }
           versionsCount={ver.versions.length}
           previewActive={ver.previewing}
+          aiPane={
+            <SidebarAi
+              active={activeSidebarTab === 'ai'}
+              hasFile={!!fileMeta}
+              config={ai.config}
+              onConfigChange={ai.updateConfig}
+              onResetSystemPrompt={ai.resetSystemPrompt}
+              messages={aiChat.messages}
+              generating={aiGenerating}
+              onSend={handleAiSend}
+              onStop={handleAiStop}
+              onClearRequest={() => setAiClearConfirmOpen(true)}
+              digits={offsetDigits(fileMeta?.size ?? 0)}
+            />
+          }
+          aiCount={aiCount}
           perf={perf}
           cacheBytes={cacheBytes}
           visibleRows={visibleRows}
@@ -1146,6 +1374,29 @@ function App() {
             onCancel={() => setRestoreConfirmId(null)}
           />
         )}
+      {/* 清空 AI 会话确认 */}
+      {aiClearConfirmOpen && (
+        <ConfirmDialog
+          title="清空当前会话"
+          message={`将删除当前文件的 ${aiChat.messages.length} 条 AI 对话记录，是否继续？`}
+          buttons={[
+            {
+              label: '清空',
+              kind: 'danger',
+              onClick: () => {
+                setAiClearConfirmOpen(false);
+                aiChat.clearChat();
+              },
+            },
+            {
+              label: '取消',
+              kind: 'plain',
+              onClick: () => setAiClearConfirmOpen(false),
+            },
+          ]}
+          onCancel={() => setAiClearConfirmOpen(false)}
+        />
+      )}
     </div>
   );
 }

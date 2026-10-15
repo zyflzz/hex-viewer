@@ -1614,3 +1614,398 @@ body {
   border-top: 1px solid var(--border);
   padding-top: 8px;
 }
+
+/* ============ AI 助手（侧栏第六选项卡） ============ */
+/* 面板自带内部滚动（对话区），外层 pane 不滚动 */
+.sidebar-pane.ai-pane {
+  overflow: hidden;
+}
+
+.ai-root {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+/* .btn.mini 自带 margin-left: 6px（为行内跟随标签设计），AI 面板内按钮独立使用需归零 */
+.ai-root .btn.mini {
+  margin-left: 0;
+}
+
+.ai-empty {
+  padding: 28px 16px;
+  text-align: center;
+}
+
+/* 配置折叠时的模型局限性提示（常驻顶部） */
+.ai-hint {
+  flex: none;
+  padding: 7px 14px;
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--dim);
+  background: var(--panel2);
+  border-bottom: 1px solid var(--border);
+}
+
+/* ---- 配置区（可折叠，默认折叠） ---- */
+.ai-config {
+  flex: none;
+  border-bottom: 1px solid var(--border);
+}
+
+.ai-config-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  width: 100%;
+  padding: 8px 14px;
+  background: none;
+  border: none;
+  color: var(--text);
+  font-size: 12.5px;
+  cursor: pointer;
+}
+
+.ai-config-head:hover {
+  color: var(--accent);
+}
+
+.ai-caret {
+  color: var(--dim);
+  font-size: 9px;
+  transition: transform 0.15s;
+}
+
+.ai-caret.open {
+  transform: rotate(90deg);
+}
+
+.ai-config-body {
+  padding: 2px 14px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 9px;
+}
+
+.ai-field {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.ai-field > label {
+  font-size: 11.5px;
+  color: var(--dim);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 6px;
+}
+
+.ai-field .input,
+.ai-field .select {
+  width: 100%;
+  font-size: 12px;
+  padding: 4px 7px;
+}
+
+.ai-field-row {
+  display: flex;
+  gap: 8px;
+}
+
+.ai-field-row .ai-field {
+  flex: 1;
+}
+
+.ai-config .seg {
+  display: flex;
+  width: 100%;
+}
+
+.ai-config .seg button {
+  flex: 1;
+  padding: 4px 8px;
+  font-size: 11.5px;
+}
+
+.ai-model-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ai-model-row .select {
+  flex: 1;
+  min-width: 0;
+}
+
+/* 配置展开时的模型局限性提示（提供方下方） */
+.ai-note {
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--dim);
+  padding: 6px 8px;
+  background: var(--panel2);
+  border-radius: 4px;
+}
+
+.ai-field-hint {
+  font-size: 11px;
+  color: var(--dim);
+}
+
+.ai-field-err {
+  font-size: 11px;
+  color: var(--err);
+  word-break: break-all;
+}
+
+.ai-restore {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.ai-restore:hover {
+  text-decoration: underline;
+}
+
+.ai-prompt {
+  resize: vertical;
+  min-height: 72px;
+  line-height: 1.5;
+}
+
+/* ---- 会话控制 ---- */
+.ai-session {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.ai-session-count {
+  font-size: 11.5px;
+  color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- 对话区 ---- */
+.ai-chat {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.ai-chat-empty {
+  text-align: center;
+  margin-top: 18px;
+}
+
+.ai-msg {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.ai-msg.user {
+  align-items: flex-end;
+}
+
+.ai-msg.assistant {
+  align-items: flex-start;
+}
+
+.ai-msg.system {
+  align-items: center;
+}
+
+.ai-bubble {
+  max-width: 94%;
+  min-width: 0;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: var(--panel2);
+  color: var(--text);
+  font-size: 12.5px;
+  line-height: 1.6;
+  word-break: break-word;
+  overflow-wrap: anywhere;
+}
+
+.ai-msg.user .ai-bubble {
+  background: var(--accent);
+  color: var(--accent-fg);
+  border-bottom-right-radius: 2px;
+}
+
+.ai-msg.assistant .ai-bubble {
+  border-bottom-left-radius: 2px;
+}
+
+.ai-msg.system .ai-bubble {
+  background: none;
+  padding: 2px 8px;
+  max-width: 100%;
+  font-size: 11.5px;
+  color: var(--dim);
+  text-align: center;
+}
+
+.ai-msg.system.error .ai-bubble {
+  color: var(--err);
+}
+
+.ai-line {
+  margin: 0;
+  white-space: pre-wrap;
+}
+
+/* AI 回复中的代码块 */
+.ai-code {
+  margin: 4px 0;
+  padding: 7px 9px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  font-family: 'Cascadia Code', 'Consolas', 'Courier New', monospace;
+  font-size: 11.5px;
+  line-height: 1.5;
+  overflow-x: auto;
+  white-space: pre;
+  max-width: 100%;
+}
+
+/* 流式生成中的闪烁光标 */
+.ai-caret-blink {
+  display: inline-block;
+  width: 7px;
+  height: 12px;
+  margin-left: 2px;
+  vertical-align: -1px;
+  background: var(--accent);
+  animation: ai-blink 0.9s steps(1) infinite;
+}
+
+@keyframes ai-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+/* 用户消息附带的数据范围标记 */
+.ai-ctx {
+  font-size: 10.5px;
+  color: var(--dim);
+  padding: 0 2px;
+  font-variant-numeric: tabular-nums;
+}
+
+.ai-copy {
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  padding: 1px 7px;
+  color: var(--dim);
+  font-size: 10.5px;
+  cursor: pointer;
+}
+
+.ai-copy:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.ai-copy.done {
+  color: var(--ok);
+}
+
+/* ---- 首次使用引导 ---- */
+.ai-guide {
+  flex: none;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.ai-guide-title {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.ai-guide-status {
+  font-size: 11.5px;
+  color: var(--dim);
+}
+
+.ai-guide-status.ok {
+  color: var(--ok);
+}
+
+.ai-guide-status.fail {
+  color: var(--err);
+}
+
+.ai-guide-btns {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* ---- 输入区 ---- */
+.ai-input-area {
+  flex: none;
+  border-top: 1px solid var(--border);
+  padding: 8px 12px 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+
+.ai-quick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.ai-quick .btn.mini {
+  font-size: 11px;
+  padding: 2px 8px;
+}
+
+.ai-input {
+  width: 100%;
+  resize: none;
+  line-height: 1.55;
+  font-size: 12.5px;
+}
+
+.ai-input-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.ai-input-hint {
+  font-size: 10.5px;
+  color: var(--dim);
+}

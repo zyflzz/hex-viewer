@@ -56,13 +56,17 @@ interface SidebarProps {
   versionsCount: number;
   /** 预览历史版本中：编辑选项卡锁定为只读 */
   previewActive: boolean;
+  /** AI 助手选项卡内容（自带配置/对话/输入布局，无需滚动容器） */
+  aiPane?: ReactNode;
+  /** 当前会话消息数（AI 标签徽章，用户 + AI 回复） */
+  aiCount: number;
   // 性能（公共底部）
   perf: PerfState;
   cacheBytes: number;
   visibleRows: number;
 }
 
-/** 侧栏容器：顶部选项卡栏 + 五个常驻 pane（display 切换保留状态）+ 底部性能监控 */
+/** 侧栏容器：顶部选项卡栏 + 六个常驻 pane（display 切换保留状态）+ 底部性能监控 */
 export function Sidebar(props: SidebarProps) {
   const {
     activeTab,
@@ -102,6 +106,8 @@ export function Sidebar(props: SidebarProps) {
     versionsPane,
     versionsCount,
     previewActive,
+    aiPane,
+    aiCount,
     perf,
     cacheBytes,
     visibleRows,
@@ -171,6 +177,15 @@ export function Sidebar(props: SidebarProps) {
             <span className="tab-badge">{versionsCount > 99 ? '99+' : versionsCount}</span>
           )}
         </button>
+        <button
+          className={`sidebar-tab${activeTab === 'ai' ? ' on' : ''}`}
+          role="tab"
+          aria-selected={activeTab === 'ai'}
+          onClick={() => onTabChange('ai')}
+        >
+          AI
+          {aiCount > 0 && <span className="tab-badge">{aiCount > 99 ? '99+' : aiCount}</span>}
+        </button>
       </div>
 
       <div className="sidebar-body">
@@ -223,6 +238,13 @@ export function Sidebar(props: SidebarProps) {
           style={{ display: activeTab === 'versions' ? 'block' : 'none' }}
         >
           {versionsPane}
+        </div>
+        {/* AI 面板自带内部滚动（对话区），外层不滚动：display 用 flex 撑满 */}
+        <div
+          className="sidebar-pane ai-pane"
+          style={{ display: activeTab === 'ai' ? 'flex' : 'none' }}
+        >
+          {aiPane}
         </div>
       </div>
 

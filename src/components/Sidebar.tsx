@@ -50,6 +50,14 @@ interface SidebarProps {
   pos: number;
   onEditSelection: () => void;
   onDiscardAll: () => void;
+  /** 填充选中区间（无选中时 App 层提示） */
+  onFill: () => void;
+  /** 从光标/选择起点粘贴 Hex */
+  onPasteHex: () => void;
+  /** 按当前显示编码粘贴文本 */
+  onPasteText: () => void;
+  /** 数据检查器（渲染在"信息"选项卡底部，自带节结构） */
+  inspector?: ReactNode;
   /** 历史版本选项卡内容（独立于编辑选项卡） */
   versionsPane?: ReactNode;
   /** 历史版本数（标签徽章） */
@@ -103,6 +111,10 @@ export function Sidebar(props: SidebarProps) {
     pos,
     onEditSelection,
     onDiscardAll,
+    onFill,
+    onPasteHex,
+    onPasteText,
+    inspector,
     versionsPane,
     versionsCount,
     previewActive,
@@ -191,6 +203,7 @@ export function Sidebar(props: SidebarProps) {
       <div className="sidebar-body">
         <div className="sidebar-pane" style={{ display: activeTab === 'info' ? 'block' : 'none' }}>
           <SidebarInfo meta={meta} stats={stats} totalRows={totalRows} />
+          {inspector}
         </div>
         <div className="sidebar-pane" style={{ display: activeTab === 'bookmarks' ? 'block' : 'none' }}>
           <SidebarBookmarks
@@ -230,6 +243,9 @@ export function Sidebar(props: SidebarProps) {
             pos={pos}
             onEditSelection={onEditSelection}
             onDiscardAll={onDiscardAll}
+            onFill={onFill}
+            onPasteHex={onPasteHex}
+            onPasteText={onPasteText}
             locked={previewActive}
           />
         </div>

@@ -1,6 +1,8 @@
 import React, { useEffect, useRef, useState } from 'react';
+import { createPortal } from 'react-dom';
 import type { DisplayConfig, TextEncoding } from '../types';
 import type { SearchMode } from '../hooks/useFileSearch';
+import type { RecentFile } from '../hooks/useRecentFiles';
 import { ENCODING_OPTIONS } from '../utils/decode';
 
 interface ToolbarProps {
@@ -11,6 +13,10 @@ interface ToolbarProps {
   unsaved: boolean;
   /** 关闭当前文件（有未保存修改时 App 层弹确认） */
   onCloseFile: () => void;
+  // 最近文件
+  recentFiles: RecentFile[];
+  onOpenRecent: (path: string) => void;
+  onClearRecent: () => void;
   // 搜索
   searchMode: SearchMode;
   setSearchMode: (m: SearchMode) => void;
@@ -23,6 +29,18 @@ interface ToolbarProps {
   searching: boolean;
   searchPercent: number; // 0..100
   searchInputRef: React.RefObject<HTMLInputElement | null>;
+  // 查找替换
+  replaceText: string;
+  setReplaceText: (t: string) => void;
+  /** 替换内容校验结果（长度与搜索内容一致且格式合法） */
+  replaceOk: boolean;
+  /** 校验失败原因（按钮禁用时展示） */
+  replaceHint: string | null;
+  /** 当前命中数（无结果时替换按钮禁用） */
+  hitCount: number;
+  onReplace: () => void;
+  onReplaceNext: () => void;
+  onReplaceAll: () => void;
   // 跳转
   gotoText: string;
   setGotoText: (t: string) => void;
@@ -44,6 +62,9 @@ export function Toolbar(props: ToolbarProps) {
     onOpenFile,
     unsaved,
     onCloseFile,
+    recentFiles,
+    onOpenRecent,
+    onClearRecent,
     searchMode,
     setSearchMode,
     searchText,
@@ -55,6 +76,14 @@ export function Toolbar(props: ToolbarProps) {
     searching,
     searchPercent,
     searchInputRef,
+    replaceText,
+    setReplaceText,
+    replaceOk,
+    replaceHint,
+    hitCount,
+    onReplace,
+    onReplaceNext,
+    onReplaceAll,
     gotoText,
     setGotoText,
     onGoto,
@@ -69,6 +98,11 @@ export function Toolbar(props: ToolbarProps) {
 
   const [showSettings, setShowSettings] = useState(false);
   const settingsRef = useRef<HTMLDivElement>(null);
+  const [showReplace, setShowReplace] = useState(false);
+  const replaceInputRef = useRef<HTMLInputElement>(null);
+  const [recentPos, setRecentPos] = useState<{ top: number; left: number } | null>(null);
+  const recentBtnRef = useRef<HTMLButtonElement>(null);
+  const recentMenuRef = useRef<HTMLDivElement>(null);
 
   // 点击面板外关闭设置
   useEffect(() => {
@@ -82,11 +116,53 @@ export function Toolbar(props: ToolbarProps) {
     return () => window.removeEventListener('mousedown', onDown);
   }, [showSettings]);
 
+  // 展开替换面板时聚焦替换输入框
+  useEffect(() => {
+    if (showReplace) replaceInputRef.current?.focus();
+  }, [showReplace]);
+
+  const toggleRecent = () => {
+    setRecentPos(prev => {
+      if (prev) return null;
+      const rect = recentBtnRef.current?.getBoundingClientRect();
+      if (!rect) return null;
+      return { top: rect.bottom + 6, left: rect.left };
+    });
+  };
+
+  // 点击外部 / 窗口尺寸变化关闭最近文件列表
+  useEffect(() => {
+    if (!recentPos) return;
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Node;
+      if (recentMenuRef.current?.contains(t) || recentBtnRef.current?.contains(t)) return;
+      setRecentPos(null);
+    };
+    const onResize = () => setRecentPos(null);
+    window.addEventListener('mousedown', onDown);
+    window.addEventListener('resize', onResize);
+    return () => {
+      window.removeEventListener('mousedown', onDown);
+      window.removeEventListener('resize', onResize);
+    };
+  }, [recentPos]);
+
   return (
     <header className="toolbar">
-      <button className="btn primary" onClick={onOpenFile}>
-        打开文件
-      </button>
+      <span className="open-anchor">
+        <button className="btn primary" onClick={onOpenFile}>
+          打开文件
+        </button>
+        <button
+          ref={recentBtnRef}
+          className={`btn icon open-recent${recentPos ? ' on' : ''}`}
+          title="最近打开的文件"
+          disabled={recentFiles.length === 0}
+          onClick={toggleRecent}
+        >
+          ▾
+        </button>
+      </span>
       {fileName && (
         <span className="toolbar-file" title={fileName}>
           {unsaved && (
@@ -109,49 +185,101 @@ export function Toolbar(props: ToolbarProps) {
 
       <div className="toolbar-sep" />
 
-      <div className="search-group">
-        <div className="seg">
+      <div className="search-anchor">
+        <div className="search-group">
+          <div className="seg">
+            <button
+              className={searchMode === 'text' ? 'on' : ''}
+              onClick={() => setSearchMode('text')}
+              title="按文本搜索（UTF-8 字节序列）"
+            >
+              文本
+            </button>
+            <button
+              className={searchMode === 'hex' ? 'on' : ''}
+              onClick={() => setSearchMode('hex')}
+              title="按十六进制字节搜索（如 AB CD 或 0xABCD）"
+            >
+              Hex
+            </button>
+          </div>
+          <input
+            ref={searchInputRef}
+            className="input search-input"
+            placeholder={searchMode === 'hex' ? 'Hex 字节，如 89504E47' : '搜索文本…'}
+            value={searchText}
+            disabled={!hasFile}
+            onChange={e => setSearchText(e.target.value)}
+            onKeyDown={e => {
+              if (e.key === 'Enter') onSearch();
+            }}
+          />
           <button
-            className={searchMode === 'text' ? 'on' : ''}
-            onClick={() => setSearchMode('text')}
-            title="按文本搜索（UTF-8 字节序列）"
+            className={`btn icon${caseSensitive ? ' on' : ''}`}
+            title="区分大小写"
+            onClick={() => setCaseSensitive(!caseSensitive)}
           >
-            文本
+            Aa
           </button>
+          {searching ? (
+            <button className="btn" onClick={onCancelSearch} title="取消搜索">
+              取消 {searchPercent > 0 ? `${searchPercent}%` : ''}
+            </button>
+          ) : (
+            <button className="btn" disabled={!hasFile || !searchText.trim()} onClick={onSearch}>
+              搜索
+            </button>
+          )}
           <button
-            className={searchMode === 'hex' ? 'on' : ''}
-            onClick={() => setSearchMode('hex')}
-            title="按十六进制字节搜索（如 AB CD 或 0xABCD）"
+            className={`btn icon${showReplace ? ' on' : ''}`}
+            title={showReplace ? '收起替换面板' : '展开替换面板'}
+            onClick={() => setShowReplace(s => !s)}
           >
-            Hex
+            ▾
           </button>
         </div>
-        <input
-          ref={searchInputRef}
-          className="input search-input"
-          placeholder={searchMode === 'hex' ? 'Hex 字节，如 89504E47' : '搜索文本…'}
-          value={searchText}
-          disabled={!hasFile}
-          onChange={e => setSearchText(e.target.value)}
-          onKeyDown={e => {
-            if (e.key === 'Enter') onSearch();
-          }}
-        />
-        <button
-          className={`btn icon${caseSensitive ? ' on' : ''}`}
-          title="区分大小写"
-          onClick={() => setCaseSensitive(!caseSensitive)}
-        >
-          Aa
-        </button>
-        {searching ? (
-          <button className="btn" onClick={onCancelSearch} title="取消搜索">
-            取消 {searchPercent > 0 ? `${searchPercent}%` : ''}
-          </button>
-        ) : (
-          <button className="btn" disabled={!hasFile || !searchText.trim()} onClick={onSearch}>
-            搜索
-          </button>
+        {showReplace && (
+          <div className="replace-pop">
+            <input
+              ref={replaceInputRef}
+              className="input replace-input"
+              placeholder={
+                searchMode === 'hex' ? '替换 Hex，如 48 65 6C 70（等长）' : '替换文本（与搜索内容等长）…'
+              }
+              value={replaceText}
+              disabled={!hasFile}
+              spellCheck={false}
+              onChange={e => setReplaceText(e.target.value)}
+              onKeyDown={e => {
+                if (e.key === 'Enter') onReplaceNext();
+              }}
+            />
+            <button
+              className="btn"
+              disabled={!replaceOk || hitCount === 0 || searching}
+              title={replaceHint ?? '替换当前活跃命中'}
+              onClick={onReplace}
+            >
+              替换
+            </button>
+            <button
+              className="btn"
+              disabled={!replaceOk || hitCount === 0 || searching}
+              title={replaceHint ?? '替换当前命中并跳到下一个'}
+              onClick={onReplaceNext}
+            >
+              替换下一个
+            </button>
+            <button
+              className="btn primary"
+              disabled={!replaceOk || hitCount === 0 || searching}
+              title={replaceHint ?? `替换全部 ${hitCount} 处命中`}
+              onClick={onReplaceAll}
+            >
+              全部替换{hitCount > 0 ? `（${hitCount > 999 ? '999+' : hitCount}）` : ''}
+            </button>
+            {replaceHint && <div className="replace-hint err">{replaceHint}</div>}
+          </div>
         )}
       </div>
 
@@ -255,10 +383,39 @@ export function Toolbar(props: ToolbarProps) {
                 </button>
               </div>
             </div>
-            <div className="settings-hint">Ctrl+滚轮 缩放 · Ctrl+F 搜索 · Ctrl+G 跳转 · 拖选字节后 Ctrl+C 复制</div>
+            <div className="settings-hint">Ctrl+滚轮 缩放 · Ctrl+F 搜索 · Ctrl+G 跳转 · 拖选字节后 Ctrl+C 复制 · Ctrl+Shift+V 粘贴 Hex</div>
           </div>
         )}
       </div>
+
+      {/* 最近文件列表：portal 到 body + fixed 定位，避免被工具栏裁剪 */}
+      {recentPos &&
+        createPortal(
+          <div ref={recentMenuRef} className="recent-pop" style={recentPos}>
+            <div className="recent-title">最近打开</div>
+            {recentFiles.map(f => {
+              const name = f.path.split(/[\\/]/).pop() ?? f.path;
+              return (
+                <button
+                  key={f.path}
+                  className="recent-item"
+                  title={f.path}
+                  onClick={() => {
+                    setRecentPos(null);
+                    onOpenRecent(f.path);
+                  }}
+                >
+                  <span className="recent-name">{name}</span>
+                  <span className="recent-path">{f.path}</span>
+                </button>
+              );
+            })}
+            <button className="recent-clear" onClick={onClearRecent}>
+              清空最近记录
+            </button>
+          </div>,
+          document.body,
+        )}
     </header>
   );
 }

@@ -49,6 +49,15 @@ interface HexViewerProps {
   onEditCancel: () => void;
   /** 预览历史版本等只读场景：禁用双击进入直接编辑 */
   readOnly?: boolean;
+  /** 搜索命中偏移（升序，引用稳定：App useMemo）；null/空 = 无高亮 */
+  hitOffsets: number[] | null;
+  /** 当前活跃命中（侧栏点选/替换导航），比普通命中更醒目 */
+  activeHitOffset: number | null;
+  /** 右键菜单：offset 为点击的字节（偏移列上为该行首字节），不可解析为 null */
+  onContextMenu?: (e: React.MouseEvent, offset: number | null) => void;
+  /** "从此处开始选择"锚点：非 null 时下次点击以此为起点扩展选择 */
+  selectionAnchor: number | null;
+  onSelectionAnchorChange: (v: number | null) => void;
 }
 
 interface RowProps {
@@ -72,6 +81,10 @@ interface RowProps {
   edits: ReadonlyMap<number, number>;
   /** 仅当直接编辑落在本行时为具体偏移 */
   editTarget: number | null;
+  /** 落在本行的命中偏移集合（引用稳定：App 层 useMemo 构建） */
+  hitSet: ReadonlySet<number> | null;
+  /** 仅当活跃命中落在本行时为具体偏移 */
+  activeHit: number | null;
   onEditCommit: (offset: number, oldValue: number, newValue: number) => void;
   onEditCancel: () => void;
   getBytes: (offset: number, len: number) => Uint8Array | null;
@@ -161,6 +174,8 @@ const Row = React.memo(function Row({
   bookmarks,
   edits,
   editTarget,
+  hitSet,
+  activeHit,
   onEditCommit,
   onEditCancel,
   getBytes,
@@ -214,6 +229,8 @@ const Row = React.memo(function Row({
     ) as React.CSSProperties | null;
     const markCls = markRange ? ' mark' : '';
     const editCls = isEdited ? ' edited' : '';
+    const isHit = hitSet !== null && hitSet.has(off);
+    const hitCls = off === activeHit ? ' hit-active' : isHit ? ' hit' : '';
 
     if (!exists) {
       // 文件末尾之外：纯占位，保持列对齐
@@ -223,7 +240,7 @@ const Row = React.memo(function Row({
     }
     if (b === null) {
       // 分片尚未到达
-      const cls = `bs m${inSel ? ' s' : ''}${isHover ? ' v' : ''}${isCursor ? ' cur' : ''}${markCls}${editCls}`;
+      const cls = `bs m${inSel ? ' s' : ''}${isHover ? ' v' : ''}${isCursor ? ' cur' : ''}${markCls}${editCls}${hitCls}`;
       hexCells.push(
         <span key={i} data-o={off} className={cls} style={markStyle ?? undefined}>
           {'--' + groupGap}
@@ -255,7 +272,7 @@ const Row = React.memo(function Row({
         <span
           key={i}
           data-o={off}
-          className={`${inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`}${isCursor ? ' cur' : ''}${markCls}${editCls}`}
+          className={`${inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`}${isCursor ? ' cur' : ''}${markCls}${editCls}${hitCls}`}
           style={markStyle ?? undefined}
         >
           {hexByte(b) + groupGap}
@@ -274,7 +291,7 @@ const Row = React.memo(function Row({
         <span
           key={i}
           data-o={off}
-          className={(inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`) + stateCls + (isCursor ? ' cur' : '') + markCls + editCls}
+          className={(inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`) + stateCls + (isCursor ? ' cur' : '') + markCls + editCls + hitCls}
           style={markStyle ?? undefined}
         >
           {cell.char}
@@ -290,12 +307,19 @@ const Row = React.memo(function Row({
       const cellMark =
         rowMarks !== null &&
         rowMarks.ranges.some(([s, e]) => off <= e && off + cell.units - 1 >= s);
+      // 命中覆盖字符任一字节则整个字符叠加命中色（活跃命中优先）
+      const cellHitActive =
+        activeHit !== null && activeHit >= off && activeHit < off + cell.units;
+      const cellHit =
+        !cellHitActive &&
+        hitSet !== null &&
+        Array.from({ length: cell.units }, (_, j) => off + j).some(o => hitSet.has(o));
       const stateCls = cell.state === 'cut' ? ' cut' : cell.state === 'invalid' ? ' invalid' : '';
       asciiCells.push(
         <span
           key={i}
           data-o={off}
-          className={`${cellSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`} multi${stateCls}${cellCursor ? ' cur' : ''}${cellMark ? ' mark' : ''}${editCls}`}
+          className={`${cellSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`} multi${stateCls}${cellCursor ? ' cur' : ''}${cellMark ? ' mark' : ''}${editCls}${cellHitActive ? ' hit-active' : cellHit ? ' hit' : ''}`}
           style={
             {
               width: `${cell.units}ch`,
@@ -314,7 +338,7 @@ const Row = React.memo(function Row({
       className={`hex-row${flash ? ' flash' : ''}`}
       style={{ height: rowHeight, fontSize, lineHeight: `${rowHeight}px` }}
     >
-      <span className="hex-offset">
+      <span className="hex-offset" data-rowstart={rowStart}>
         <span className="hex-bm-slot">
           {rowMarks?.dot != null && (
             <span className="hex-bm-dot" style={{ background: rowMarks.dot }} />
@@ -351,6 +375,11 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
     onEditCommit,
     onEditCancel,
     readOnly = false,
+    hitOffsets,
+    activeHitOffset,
+    onContextMenu,
+    selectionAnchor,
+    onSelectionAnchorChange,
   },
   ref,
 ) {
@@ -508,6 +537,16 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
     return Number.isFinite(v) ? v : null;
   }, []);
 
+  /** 字节偏移；落在偏移列上时解析为该行首字节 */
+  const contextOffsetFromEvent = useCallback((e: React.MouseEvent): number | null => {
+    const off = offsetFromEvent(e);
+    if (off !== null) return off;
+    const row = (e.target as HTMLElement).closest?.('[data-rowstart]');
+    if (!row) return null;
+    const v = Number((row as HTMLElement).dataset.rowstart);
+    return Number.isFinite(v) ? v : null;
+  }, [offsetFromEvent]);
+
   const handleMouseDown = useCallback(
     (e: React.MouseEvent) => {
       if (e.button !== 0) return;
@@ -517,6 +556,18 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
       // preventDefault 会阻止默认聚焦，手动聚焦容器以启用键盘导航
       parentRef.current?.focus({ preventScroll: true });
       shiftAnchorRef.current = null;
+      if (selectionAnchor !== null) {
+        // "从此处开始选择"待定锚点：本次点击确定终点并消费锚点
+        dragAnchorRef.current = selectionAnchor;
+        onSelectionAnchorChange(null);
+        onSelectionChange({
+          start: Math.min(selectionAnchor, off),
+          end: Math.max(selectionAnchor, off),
+        });
+        onCursorChange(off);
+        draggingRef.current = true;
+        return;
+      }
       if (e.shiftKey && selection) {
         // Shift 点击：以现有选择另一端为锚点扩展
         const anchor = Math.abs(off - selection.start) > Math.abs(off - selection.end)
@@ -531,7 +582,24 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
       onCursorChange(off);
       draggingRef.current = true;
     },
-    [offsetFromEvent, selection, onSelectionChange, onCursorChange],
+    [
+      offsetFromEvent,
+      selection,
+      selectionAnchor,
+      onSelectionAnchorChange,
+      onSelectionChange,
+      onCursorChange,
+    ],
+  );
+
+  /** 右键：定位字节偏移（偏移列 → 行首字节），交由上层弹菜单 */
+  const handleContextMenu = useCallback(
+    (e: React.MouseEvent) => {
+      if (!onContextMenu) return;
+      e.preventDefault();
+      onContextMenu(e, contextOffsetFromEvent(e));
+    },
+    [onContextMenu, contextOffsetFromEvent],
   );
 
   /** 直接编辑模式：双击字节进入行内编辑（预览历史版本时禁用） */
@@ -579,6 +647,22 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
     [selection, rowBytes],
   );
 
+  /** 命中偏移按行分组（引用随 hitOffsets 稳定，保证 Row memo 命中） */
+  const hitsByRow = useMemo(() => {
+    if (!hitOffsets || hitOffsets.length === 0) return null;
+    const m = new Map<number, Set<number>>();
+    for (const off of hitOffsets) {
+      const r = Math.floor(off / rowBytes);
+      let set = m.get(r);
+      if (!set) {
+        set = new Set<number>();
+        m.set(r, set);
+      }
+      set.add(off);
+    }
+    return m;
+  }, [hitOffsets, rowBytes]);
+
   if (totalRows === 0) {
     return (
       <div className="hex-viewer hex-viewer-empty">
@@ -597,6 +681,7 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
       onMouseMove={handleMouseMove}
       onMouseLeave={() => onHoverOffsetChange(null)}
       onDoubleClick={handleDoubleClick}
+      onContextMenu={handleContextMenu}
     >
       <div
         className="hex-total"
@@ -616,6 +701,12 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
           const editTargetInRow =
             editTarget !== null && editTarget >= rowStart && editTarget < rowStart + rowBytes
               ? editTarget
+              : null;
+          const activeHitInRow =
+            activeHitOffset !== null &&
+            activeHitOffset >= rowStart &&
+            activeHitOffset < rowStart + rowBytes
+              ? activeHitOffset
               : null;
           const flash =
             flashOffset !== null && flashOffset >= rowStart && flashOffset < rowStart + rowBytes;
@@ -649,6 +740,8 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
                 bookmarks={bookmarks}
                 edits={edits}
                 editTarget={editTargetInRow}
+                hitSet={hitsByRow?.get(v.index) ?? null}
+                activeHit={activeHitInRow}
                 onEditCommit={onEditCommit}
                 onEditCancel={onEditCancel}
                 getBytes={getBytes}

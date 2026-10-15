@@ -29,6 +29,12 @@ interface SidebarEditProps {
   onEditSelection: () => void;
   /** 放弃全部未保存修改（App 层弹确认） */
   onDiscardAll: () => void;
+  /** 填充选中区间（无选中时 App 层提示） */
+  onFill: () => void;
+  /** 从光标/选择起点粘贴 Hex（Ctrl+Shift+V） */
+  onPasteHex: () => void;
+  /** 按当前显示编码粘贴文本 */
+  onPasteText: () => void;
   /** 预览历史版本中：禁用编辑/撤销/恢复/放弃 */
   locked?: boolean;
 }
@@ -59,6 +65,9 @@ export function SidebarEdit({
   pos,
   onEditSelection,
   onDiscardAll,
+  onFill,
+  onPasteHex,
+  onPasteText,
   locked = false,
 }: SidebarEditProps) {
   const hasFile = !!meta && meta.size > 0;
@@ -122,6 +131,30 @@ export function SidebarEdit({
               title="按当前模式编辑光标/选中区间（Enter / Ctrl+E）"
             >
               开始编辑
+            </button>
+            <button
+              className="btn mini"
+              disabled={readonly || locked}
+              onClick={onFill}
+              title="把选中区间全部填充为指定字节值"
+            >
+              填充区间
+            </button>
+            <button
+              className="btn mini"
+              disabled={readonly || locked}
+              onClick={onPasteHex}
+              title="把剪贴板 Hex 写入光标/选择起点（Ctrl+Shift+V）"
+            >
+              粘贴 Hex
+            </button>
+            <button
+              className="btn mini"
+              disabled={readonly || locked}
+              onClick={onPasteText}
+              title="按当前显示编码把剪贴板文本写入光标/选择起点"
+            >
+              粘贴文本
             </button>
             <button
               className="btn mini"

@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type MouseEvent as ReactMouseEvent } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
 import { open as openFileDialog, save as saveFileDialog } from '@tauri-apps/plugin-dialog';
 import { HexViewer, type HexViewerHandle } from './components/HexViewer';
 import { Toolbar } from './components/Toolbar';
@@ -7,6 +8,9 @@ import { Sidebar } from './components/Sidebar';
 import { StatusBar } from './components/StatusBar';
 import { EditDialog } from './components/EditDialog';
 import { ConfirmDialog } from './components/ConfirmDialog';
+import { FillDialog } from './components/FillDialog';
+import { ContextMenu, type ContextMenuEntry } from './components/ContextMenu';
+import { DataInspector } from './components/DataInspector';
 import { useDisplayConfig } from './hooks/useDisplayConfig';
 import { useFileWindow } from './hooks/useFileWindow';
 import { useFileEdits } from './hooks/useFileEdits';
@@ -15,6 +19,7 @@ import { useFileStats } from './hooks/useFileStats';
 import { usePerfMonitor } from './hooks/usePerfMonitor';
 import { useFileBookmarks } from './hooks/useFileBookmarks';
 import { useFileVersions, type CleanupOptions } from './hooks/useFileVersions';
+import { useRecentFiles } from './hooks/useRecentFiles';
 import { useAiConfig } from './hooks/useAiConfig';
 import { useAiChat } from './hooks/useAiChat';
 import { streamChat, type ApiChatMessage } from './utils/aiClient';
@@ -31,9 +36,12 @@ import {
   parseOffsetInput,
 } from './utils/format';
 import { decodeBytesToText, encodingLabel } from './utils/decode';
+import { encodeTextToBytes, parseHexPattern } from './utils/hexParse';
 import './App.css';
 
 const MAX_COPY_BYTES = 4 * 1024 * 1024;
+/** 全部替换单次命中的上限（超过提示分批，避免一次生成过大的编辑操作） */
+const REPLACE_ALL_LIMIT = 5000;
 /** AI 流式请求无响应超时（毫秒），每个增量重置 */
 const AI_TIMEOUT_MS = 60_000;
 /** 单次请求携带的历史消息上限（含当前提问，控制提示词长度） */
@@ -88,6 +96,12 @@ function App() {
   const ver = useFileVersions(fileMeta, edit);
   const ai = useAiConfig();
   const aiChat = useAiChat(fileMeta);
+  const {
+    recentFiles,
+    addRecent,
+    removeRecent,
+    clearRecent,
+  } = useRecentFiles();
   const [aiGenerating, setAiGenerating] = useState(false);
   const [aiClearConfirmOpen, setAiClearConfirmOpen] = useState(false);
   const aiAbortRef = useRef<AbortController | null>(null);
@@ -113,6 +127,13 @@ function App() {
   const [searchText, setSearchText] = useState('');
   const [caseSensitive, setCaseSensitive] = useState(false);
   const [gotoText, setGotoText] = useState('');
+  const [replaceText, setReplaceText] = useState('');
+
+  // v1.1.2：填充对话框 / 右键菜单 / 拖拽 / "从此处开始选择"锚点
+  const [fillRange, setFillRange] = useState<{ start: number; end: number } | null>(null);
+  const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; offset: number } | null>(null);
+  const [dragActive, setDragActive] = useState(false);
+  const [selectionAnchor, setSelectionAnchor] = useState<number | null>(null);
 
   // 编辑状态：直接模式行内编辑目标 / 对话框编辑区间 / 各确认弹窗 / 保存中
   const [directEditOffset, setDirectEditOffset] = useState<number | null>(null);
@@ -155,9 +176,12 @@ function App() {
     setFlashOffset(null);
     setDirectEditOffset(null);
     setEditDialogRange(null);
+    setFillRange(null);
+    setCtxMenu(null);
+    setSelectionAnchor(null);
   }, []);
 
-  /** 实际执行打开（无确认） */
+  /** 实际执行打开（无确认）；成功记入最近文件，失败从最近列表移除 */
   const performOpen = useCallback(
     async (path: string) => {
       resetInteractionState();
@@ -165,12 +189,17 @@ function App() {
         const meta = await openFile(path);
         // 光标初始设在偏移 0；空文件不显示光标
         setCursorOffset(meta.size > 0 ? 0 : null);
+        addRecent(path);
       } catch (err) {
-        showToast(`打开文件失败: ${err}`);
+        removeRecent(path);
+        const known = recentFiles.some(f => f.path === path);
+        showToast(
+          known ? `文件已不存在，已从最近列表移除（${err}）` : `打开文件失败: ${err}`,
+        );
         console.error(err);
       }
     },
-    [openFile, resetInteractionState, showToast],
+    [openFile, resetInteractionState, addRecent, removeRecent, recentFiles, showToast],
   );
 
   /** 实际执行关闭（无确认） */
@@ -178,6 +207,20 @@ function App() {
     closeFile();
     resetInteractionState();
   }, [closeFile, resetInteractionState]);
+
+  /** 按路径打开文件（系统对话框 / 最近文件 / 拖拽共用）：处理预览与未保存确认 */
+  const openPath = useCallback(
+    (path: string) => {
+      // 预览不改动真实状态：先退出，未保存判断与保存路径不受预览影响
+      ver.exitPreview();
+      if (edit.editCount > 0) {
+        setUnsavedAction({ kind: 'open', path });
+        return;
+      }
+      void performOpen(path);
+    },
+    [ver, edit.editCount, performOpen],
+  );
 
   const handleOpenFile = useCallback(async () => {
     try {
@@ -187,19 +230,12 @@ function App() {
         filters: [{ name: '所有文件', extensions: ['*'] }],
       });
       if (!selected) return;
-      const path = selected as string;
-      // 预览不改动真实状态：先退出，未保存判断与保存路径不受预览影响
-      ver.exitPreview();
-      if (edit.editCount > 0) {
-        setUnsavedAction({ kind: 'open', path });
-        return;
-      }
-      await performOpen(path);
+      openPath(selected as string);
     } catch (err) {
       showToast(`打开文件失败: ${err}`);
       console.error(err);
     }
-  }, [edit.editCount, ver, performOpen, showToast]);
+  }, [openPath, showToast]);
 
   const handleCloseFile = useCallback(() => {
     if (!fileMeta) return;
@@ -299,17 +335,38 @@ function App() {
     [cursorOffset, bm, jumpToBookmark, showToast],
   );
 
-  const handleSearch = useCallback(() => {
+  const handleSearch = useCallback(async () => {
     // 空内容不发搜索，也不切换选项卡
     if (!searchText.trim()) return;
     setActiveSidebarTab('search');
-    search.runSearch(searchMode, searchText, caseSensitive);
+    const results = await search.runSearch(searchMode, searchText, caseSensitive);
+    // 搜索完成即定位首个命中（驱动主视图高亮与"替换"目标）
+    setActiveHitOffset(results.length > 0 ? results[0].offset : null);
   }, [search, searchMode, searchText, caseSensitive]);
 
   /** 显示用覆盖层：预览历史版本时为临时覆盖层（版本内容），否则为真实编辑覆盖层 */
   const displayEdits = useMemo(
     () => ver.previewOverlay ?? edit.edits,
     [ver.previewOverlay, edit.edits],
+  );
+
+  /** 命中偏移数组（升序，引用随结果稳定，供主视图高亮） */
+  const hitOffsets = useMemo(
+    () => (search.results.length > 0 ? search.results.map(r => r.offset) : null),
+    [search.results],
+  );
+
+  /** 读取"所见即所得"字节（后端范围 + 显示覆盖层），供检查器/替换/填充/粘贴取旧值 */
+  const readDisplayRange = useCallback(
+    async (offset: number, len: number): Promise<Uint8Array> => {
+      const data = await readRange(offset, len);
+      for (let i = 0; i < data.length; i++) {
+        const v = displayEdits.get(offset + i);
+        if (v !== undefined) data[i] = v;
+      }
+      return data;
+    },
+    [readRange, displayEdits],
   );
 
   /** 复制选中字节（Hex / 按指定编码解码的文本） */
@@ -522,6 +579,379 @@ function App() {
   const handleEditCancel = useCallback(() => {
     setDirectEditOffset(null);
   }, []);
+
+  // ---------- v1.1.2：查找替换 / 填充 / 粘贴 / 右键菜单 ----------
+
+  /** 可编辑判定（替换 / 填充 / 粘贴共用） */
+  const canEditNow =
+    !!fileMeta && fileMeta.size > 0 && !fileMeta.is_readonly && !ver.previewing;
+
+  /** 搜索模式字节长度（文本 = UTF-8，Hex = 解析结果；非法 / 空为 -1/0） */
+  const searchLen = useMemo(() => {
+    if (searchMode === 'hex') {
+      const b = parseHexPattern(searchText);
+      return b ? b.length : -1;
+    }
+    return searchText.length > 0 ? encodeTextToBytes(searchText, 'utf-8').length : 0;
+  }, [searchMode, searchText]);
+
+  /** 替换内容字节 + 等长校验（与搜索内容一致才可执行） */
+  const { replaceBytes, replaceOk, replaceHint } = useMemo(() => {
+    if (searchLen <= 0) {
+      const hint =
+        searchMode === 'hex' && searchText.trim() !== '' && !parseHexPattern(searchText)
+          ? '搜索内容不是有效的 Hex 字符串'
+          : null;
+      return { replaceBytes: null, replaceOk: false, replaceHint: hint };
+    }
+    if (replaceText.trim() === '') {
+      return { replaceBytes: null, replaceOk: false, replaceHint: '待输入替换内容' };
+    }
+    const bytes =
+      searchMode === 'hex' ? parseHexPattern(replaceText) : encodeTextToBytes(replaceText, 'utf-8');
+    if (!bytes || bytes.length === 0) {
+      return {
+        replaceBytes: null,
+        replaceOk: false,
+        replaceHint: searchMode === 'hex' ? '替换内容不是有效的 Hex 字符串' : '替换内容为空',
+      };
+    }
+    if (bytes.length !== searchLen) {
+      return {
+        replaceBytes: null,
+        replaceOk: false,
+        replaceHint: `替换内容长度必须与搜索内容一致（${searchLen} 字节）`,
+      };
+    }
+    return { replaceBytes: bytes, replaceOk: true, replaceHint: null };
+  }, [searchMode, replaceText, searchLen]);
+
+  /** 编辑操作标签用的内容片段（过长截断） */
+  const labelPart = (raw: string, max = 12) => `"${raw.length > max ? raw.slice(0, max) + '…' : raw}"`;
+
+  /** 当前活跃命中：侧栏选择 > 光标所在命中 > 无 */
+  const getActiveHit = useCallback(() => {
+    const rs = search.results;
+    if (rs.length === 0) return null;
+    if (activeHitOffset !== null) {
+      const h = rs.find(r => r.offset === activeHitOffset);
+      if (h) return h;
+    }
+    const cur = cursorOffset;
+    if (cur !== null && searchLen > 0) {
+      const h = rs.find(r => cur >= r.offset && cur < r.offset + searchLen);
+      if (h) return h;
+    }
+    return null;
+  }, [search.results, activeHitOffset, cursorOffset, searchLen]);
+
+  /** 替换单个命中（等长 diff 生成 change）；返回是否实际产生了编辑 */
+  const replaceOne = useCallback(
+    async (hitOffset: number): Promise<boolean> => {
+      if (!replaceOk || !replaceBytes || !fileMeta) return false;
+      const old = await readDisplayRange(hitOffset, replaceBytes.length);
+      const changes: Array<{ offset: number; oldValue: number; newValue: number }> = [];
+      for (let i = 0; i < replaceBytes.length; i++) {
+        if (old[i] !== replaceBytes[i]) {
+          changes.push({ offset: hitOffset + i, oldValue: old[i], newValue: replaceBytes[i] });
+        }
+      }
+      if (changes.length === 0) {
+        showToast('内容无变化（替换值与当前值相同）');
+        return false;
+      }
+      const from = labelPart(searchText);
+      const to = labelPart(replaceText);
+      edit.applyEdit(changes, `替换 @${hexOffset(hitOffset, offsetDigits(fileMeta.size))} ${from}→${to}`);
+      return true;
+    },
+    // labelPart 为模块级纯展示函数，无需进依赖
+    [replaceOk, replaceBytes, fileMeta, readDisplayRange, edit, showToast, searchText, replaceText],
+  );
+
+  /** 替换当前活跃命中；完成后结果过期，清空并提示重新搜索 */
+  const doReplace = useCallback(async () => {
+    if (!canEditNow) {
+      showToast(ver.previewing ? '预览历史版本中，请先返回当前内容' : '当前文件不可编辑');
+      return;
+    }
+    if (search.running) return;
+    const hit = getActiveHit();
+    if (!hit) {
+      showToast('请先在搜索结果中选择一个命中');
+      return;
+    }
+    if (!(await replaceOne(hit.offset))) return;
+    search.clearSearch();
+    setActiveHitOffset(null);
+    showToast('已替换，内容已变更，请重新搜索');
+  }, [canEditNow, ver.previewing, search, getActiveHit, replaceOne, showToast]);
+
+  /** 替换下一个：先替换当前，再跳到下一个命中（结果保留，其余命中仍有效） */
+  const doReplaceNext = useCallback(async () => {
+    if (!canEditNow) {
+      showToast(ver.previewing ? '预览历史版本中，请先返回当前内容' : '当前文件不可编辑');
+      return;
+    }
+    if (search.running) return;
+    const rs = search.results;
+    const hit = getActiveHit();
+    if (!hit) {
+      showToast('请先在搜索结果中选择一个命中');
+      return;
+    }
+    await replaceOne(hit.offset);
+    const idx = rs.findIndex(r => r.offset === hit.offset);
+    const next = rs[(idx + 1) % rs.length];
+    if (next) {
+      setActiveHitOffset(next.offset);
+      jumpToOffset(next.offset);
+    }
+  }, [canEditNow, ver.previewing, search, getActiveHit, replaceOne, jumpToOffset, showToast]);
+
+  /** 全部替换：合并相邻命中分块读取，一条 EditOp 整体撤销 */
+  const doReplaceAll = useCallback(async () => {
+    if (!canEditNow) {
+      showToast(ver.previewing ? '预览历史版本中，请先返回当前内容' : '当前文件不可编辑');
+      return;
+    }
+    if (search.running) return;
+    const rs = search.results;
+    if (rs.length === 0) {
+      showToast('请先搜索');
+      return;
+    }
+    if (rs.length > REPLACE_ALL_LIMIT) {
+      showToast(`命中过多（${rs.length} 处），建议分批替换`);
+      return;
+    }
+    // 相邻（间距 ≤8 字节）命中合并成块读取，减少后端调用
+    const merged: Array<{ start: number; end: number; hits: number[] }> = [];
+    for (const r of rs) {
+      const last = merged[merged.length - 1];
+      if (last && r.offset <= last.end + 8) {
+        last.end = Math.max(last.end, r.offset + searchLen);
+        last.hits.push(r.offset);
+      } else {
+        merged.push({ start: r.offset, end: r.offset + searchLen, hits: [r.offset] });
+      }
+    }
+    const changes: Array<{ offset: number; oldValue: number; newValue: number }> = [];
+    let replacedCount = 0;
+    try {
+      for (const m of merged) {
+        const data = await readDisplayRange(m.start, m.end - m.start);
+        for (const off of m.hits) {
+          let changed = false;
+          for (let i = 0; i < searchLen; i++) {
+            const oldV = data[off - m.start + i];
+            if (oldV !== replaceBytes![i]) {
+              changes.push({ offset: off + i, oldValue: oldV, newValue: replaceBytes![i] });
+              changed = true;
+            }
+          }
+          if (changed) replacedCount++;
+        }
+      }
+    } catch (err) {
+      console.error(err);
+      showToast('读取当前内容失败');
+      return;
+    }
+    if (changes.length === 0) {
+      showToast('内容无变化');
+      return;
+    }
+    edit.applyEdit(changes, `替换全部 ${labelPart(searchText)}→${labelPart(replaceText)}（${replacedCount} 处）`);
+    search.clearSearch();
+    setActiveHitOffset(null);
+    showToast(`已替换 ${replacedCount} 处，可 Ctrl+Z 撤销`);
+  }, [canEditNow, ver.previewing, search, searchLen, replaceBytes, readDisplayRange, edit, showToast, searchText, replaceText]);
+
+  /** 填充入口：校验后弹对话框（无选中时提示） */
+  const startFill = useCallback(() => {
+    if (!fileMeta || fileMeta.size === 0) return;
+    if (ver.previewing) {
+      showToast('预览历史版本中，请先返回当前内容');
+      return;
+    }
+    if (fileMeta.is_readonly) {
+      showToast('文件为只读');
+      return;
+    }
+    if (!selection) {
+      showToast('请先选择要填充的区间');
+      return;
+    }
+    setFillRange({ start: selection.start, end: selection.end });
+  }, [fileMeta, selection, ver.previewing, showToast]);
+
+  /** 填充提交：跳过已等于填充值的字节 */
+  const commitFill = useCallback(
+    async (value: number) => {
+      const range = fillRange;
+      setFillRange(null);
+      if (!range || !fileMeta) return;
+      const len = range.end - range.start + 1;
+      const old = await readDisplayRange(range.start, len);
+      const changes: Array<{ offset: number; oldValue: number; newValue: number }> = [];
+      for (let i = 0; i < len; i++) {
+        if (old[i] !== value) {
+          changes.push({ offset: range.start + i, oldValue: old[i], newValue: value });
+        }
+      }
+      if (changes.length === 0) {
+        showToast('内容无变化（区间已是该值）');
+        return;
+      }
+      const d = offsetDigits(fileMeta.size);
+      edit.applyEdit(
+        changes,
+        `填充 @${hexOffset(range.start, d)}–${hexOffset(range.end, d)} = ${hexByte(value)}（${len} 字节）`,
+      );
+    },
+    [fillRange, fileMeta, readDisplayRange, edit, showToast],
+  );
+
+  /**
+   * 粘贴（等长覆盖）：从剪贴板读文本 → Hex 解析 / 按显示编码编码为字节，
+   * 写入目标位置开始的连续 N 字节，超出文件末尾截断。
+   */
+  const pasteFromClipboard = useCallback(
+    async (kind: 'hex' | 'text', targetOverride?: number) => {
+      if (!fileMeta || fileMeta.size === 0) return;
+      if (ver.previewing) {
+        showToast('预览历史版本中，请先返回当前内容');
+        return;
+      }
+      if (fileMeta.is_readonly) {
+        showToast('文件为只读');
+        return;
+      }
+      const target = targetOverride ?? cursorOffset ?? selection?.start ?? null;
+      if (target === null) {
+        showToast('请先点击一个字节设置光标');
+        return;
+      }
+      let text: string;
+      try {
+        text = await navigator.clipboard.readText();
+      } catch {
+        showToast('读取剪贴板失败');
+        return;
+      }
+      if (!text) {
+        showToast('剪贴板为空');
+        return;
+      }
+      const bytes =
+        kind === 'hex' ? parseHexPattern(text) : encodeTextToBytes(text, config.encoding);
+      if (!bytes || bytes.length === 0) {
+        showToast(
+          kind === 'hex' ? '剪贴板内容不是有效的 Hex 字符串' : '剪贴板内容无法编码为字节',
+        );
+        return;
+      }
+      const maxLen = fileMeta.size - target;
+      if (maxLen <= 0) {
+        showToast('目标位置已到文件末尾');
+        return;
+      }
+      const take = Math.min(bytes.length, maxLen);
+      const truncated = take < bytes.length;
+      const old = await readDisplayRange(target, take);
+      const changes: Array<{ offset: number; oldValue: number; newValue: number }> = [];
+      for (let i = 0; i < take; i++) {
+        if (old[i] !== bytes[i]) {
+          changes.push({ offset: target + i, oldValue: old[i], newValue: bytes[i] });
+        }
+      }
+      if (changes.length > 0) {
+        edit.applyEdit(
+          changes,
+          `粘贴 @${hexOffset(target, offsetDigits(fileMeta.size))}（${take} 字节）`,
+        );
+      } else if (!truncated) {
+        showToast('内容无变化');
+      }
+      if (truncated) showToast('粘贴内容超出文件末尾，已截断');
+    },
+    [fileMeta, ver.previewing, cursorOffset, selection, config.encoding, readDisplayRange, edit, showToast],
+  );
+
+  /** 主视图右键：定位字节偏移（偏移列 → 行首字节）后弹菜单 */
+  const openContextMenu = useCallback((e: ReactMouseEvent, offset: number | null) => {
+    if (offset === null) return;
+    setCtxMenu({ x: e.clientX, y: e.clientY, offset });
+  }, []);
+
+  /** 右键菜单条目（启用/禁用随当前状态派生） */
+  const ctxEntries = useMemo<ContextMenuEntry[]>(() => {
+    if (!ctxMenu) return [];
+    const off = ctxMenu.offset;
+    const editable = !!fileMeta && fileMeta.size > 0 && !fileMeta.is_readonly && !ver.previewing;
+    const hasSel = selection !== null;
+    const pointBm = bm.sorted.find(b => b.start === off && b.end === off);
+    const d = fileMeta ? offsetDigits(fileMeta.size) : 8;
+    const item = (
+      key: string,
+      label: string,
+      onSelect: () => void,
+      disabled = false,
+    ): ContextMenuEntry => ({ key, item: { key, label, onSelect, disabled } });
+    return [
+      item('copyHex', '复制 Hex', () => void copySelection('hex'), !hasSel),
+      item('copyText', '复制文本', () => void copySelection('text'), !hasSel),
+      item('pasteHex', '粘贴 Hex', () => void pasteFromClipboard('hex', off), !editable),
+      item('pasteText', '粘贴文本', () => void pasteFromClipboard('text', off), !editable),
+      { key: 'sep1', sep: true },
+      item('editByte', '编辑此字节', () => {
+        // 按当前编辑模式分流（与 startEdit 一致）
+        setActiveSidebarTab('edit');
+        if (config.editMode === 'direct') {
+          handleEditStart(off);
+        } else {
+          setEditDialogRange({ start: off, end: off });
+        }
+      }, !editable),
+      item('fill', '填充选中区间', startFill, !editable || !hasSel),
+      { key: 'sep2', sep: true },
+      pointBm
+        ? item('delBm', '删除此处书签', () => bm.removeBookmark(pointBm.id))
+        : item('addBm', '在此处加书签', () => {
+            bm.toggleBookmarkAt(off);
+            setActiveSidebarTab('bookmarks');
+          }),
+      item('mark', '把选中区间标为标记', addMarkFromSelection, !hasSel),
+      { key: 'sep3', sep: true },
+      item('goto', '跳转到此偏移', () => {
+        setGotoText(`0x${hexOffset(off, d)}`);
+        gotoInputRef.current?.focus();
+      }, !fileMeta || fileMeta.size === 0),
+      item('selFrom', '从此处开始选择', () => {
+        setSelectionAnchor(off);
+        showToast('已设置选择起点，点击另一字节完成选择');
+      }, !fileMeta || fileMeta.size === 0),
+      { key: 'sep4', sep: true },
+      item('ai', 'AI 分析选中内容', () => {
+        setActiveSidebarTab('ai');
+        showToast('已切换到 AI 助手，直接发送即可分析选中内容');
+      }, !hasSel),
+    ];
+  }, [
+    ctxMenu,
+    fileMeta,
+    selection,
+    ver.previewing,
+    bm,
+    copySelection,
+    pasteFromClipboard,
+    startFill,
+    addMarkFromSelection,
+    config.editMode,
+    handleEditStart,
+    showToast,
+  ]);
 
   /** 对话框"当前值"：原始内容 + 覆盖层（与视图一致） */
   const loadDialogBytes = useCallback(async () => {
@@ -886,6 +1316,32 @@ function App() {
     document.documentElement.dataset.theme = config.theme;
   }, [config.theme]);
 
+  // 拖拽打开文件：Tauri 拦截 WebView 拖放并以原生事件下发（tauri.conf 未关闭 dragDropEnabled）
+  useEffect(() => {
+    const unsubs: Array<Promise<() => void>> = [];
+    unsubs.push(
+      listen('tauri://drag-enter', () => setDragActive(true)),
+      listen('tauri://drag-over', () => setDragActive(true)),
+      listen('tauri://drag-leave', () => setDragActive(false)),
+      listen<{ paths?: string[]; path?: string }>('tauri://drag-drop', e => {
+        setDragActive(false);
+        const payload = e.payload;
+        const paths =
+          payload?.paths && payload.paths.length > 0
+            ? payload.paths
+            : payload?.path
+              ? [payload.path]
+              : [];
+        if (paths.length === 0) return;
+        if (paths.length > 1) showToast('暂不支持一次打开多个文件');
+        openPath(paths[0]);
+      }),
+    );
+    return () => {
+      for (const p of unsubs) p.then(un => un()).catch(() => {});
+    };
+  }, [openPath, showToast]);
+
   // 编辑结束（行内编辑框 / 对话框卸载）后焦点会落到 body，方向键导航失效；
   // 仅在焦点仍停留在 body 时重新聚焦视图容器（用户已点击其他控件则不抢焦点）
   const prevDirectEdit = useRef<number | null>(null);
@@ -941,12 +1397,17 @@ function App() {
           setDirectEditOffset(null);
           return;
         }
+        setSelectionAnchor(null); // 同时取消"从此处开始选择"的待定锚点
         setSelection(null);
         (document.activeElement as HTMLElement | null)?.blur?.();
       } else if (ctrl && key === 'c' && !inInput && selection) {
         e.preventDefault();
         // Ctrl+C 复制 Hex，Ctrl+Shift+C 按当前显示编码复制文本（预览中同样可用）
         copySelection(e.shiftKey ? 'text' : 'hex');
+      } else if (ctrl && e.shiftKey && key === 'v' && !inInput) {
+        // Ctrl+Shift+V 粘贴 Hex（Ctrl+V 保持系统默认文本粘贴不拦截）
+        e.preventDefault();
+        void pasteFromClipboard('hex');
       } else if (ctrl && key === 'b' && !inInput) {
         // Ctrl+B 切换光标处书签；Ctrl+Shift+B 把选择转成标记（预览中禁用）
         e.preventDefault();
@@ -1019,6 +1480,7 @@ function App() {
     startEdit,
     ver,
     showToast,
+    pasteFromClipboard,
   ]);
 
   // 清理计时器
@@ -1037,12 +1499,20 @@ function App() {
 
   return (
     <div className="app-container" data-theme={config.theme}>
+      {dragActive && (
+        <div className="drag-overlay" aria-hidden>
+          <div className="drag-overlay-inner">松开以打开文件</div>
+        </div>
+      )}
       <Toolbar
         hasFile={!!fileMeta}
         fileName={fileMeta?.name ?? null}
         onOpenFile={handleOpenFile}
         unsaved={edit.editCount > 0}
         onCloseFile={handleCloseFile}
+        recentFiles={recentFiles}
+        onOpenRecent={openPath}
+        onClearRecent={clearRecent}
         searchMode={searchMode}
         setSearchMode={setSearchMode}
         searchText={searchText}
@@ -1054,6 +1524,14 @@ function App() {
         searching={search.running}
         searchPercent={searchPercent}
         searchInputRef={searchInputRef}
+        replaceText={replaceText}
+        setReplaceText={setReplaceText}
+        replaceOk={replaceOk}
+        replaceHint={replaceHint}
+        hitCount={search.results.length}
+        onReplace={doReplace}
+        onReplaceNext={doReplaceNext}
+        onReplaceAll={doReplaceAll}
         gotoText={gotoText}
         setGotoText={setGotoText}
         onGoto={handleGoto}
@@ -1120,6 +1598,11 @@ function App() {
               onEditCommit={handleEditCommit}
               onEditCancel={handleEditCancel}
               readOnly={ver.previewing}
+              hitOffsets={hitOffsets}
+              activeHitOffset={activeHitOffset}
+              onContextMenu={openContextMenu}
+              selectionAnchor={selectionAnchor}
+              onSelectionAnchorChange={setSelectionAnchor}
             />
           ) : (
             <div className="hex-viewer hex-viewer-empty">
@@ -1171,6 +1654,17 @@ function App() {
           pos={edit.pos}
           onEditSelection={startEdit}
           onDiscardAll={() => setDiscardConfirmOpen(true)}
+          onFill={startFill}
+          onPasteHex={() => void pasteFromClipboard('hex')}
+          onPasteText={() => void pasteFromClipboard('text')}
+          inspector={
+            <DataInspector
+              offset={cursorOffset}
+              fileSize={fileMeta?.size ?? 0}
+              readRange={readDisplayRange}
+              digits={offsetDigits(fileMeta?.size ?? 0)}
+            />
+          }
           versionsPane={
             <SidebarVersions
               meta={fileMeta}
@@ -1237,6 +1731,20 @@ function App() {
           onCancel={() => setEditDialogRange(null)}
         />
       )}
+
+      {/* 填充选中区间 */}
+      {fillRange && fileMeta && (
+        <FillDialog
+          start={fillRange.start}
+          end={fillRange.end}
+          digits={offsetDigits(fileMeta.size)}
+          onCommit={v => void commitFill(v)}
+          onCancel={() => setFillRange(null)}
+        />
+      )}
+
+      {/* 主视图右键菜单 */}
+      {ctxMenu && <ContextMenu x={ctxMenu.x} y={ctxMenu.y} entries={ctxEntries} onClose={() => setCtxMenu(null)} />}
 
       {/* 未保存三选一（打开/关闭文件前） */}
       {unsavedAction && (

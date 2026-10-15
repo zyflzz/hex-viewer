@@ -28,6 +28,8 @@
   --perf-cpu: #f0a45d;
   --scroll: #4f4f4f;
   --edit: #e5b567;
+  --hit: rgba(14, 99, 156, 0.35);
+  --hit-active: rgba(229, 181, 103, 0.4);
   color-scheme: dark;
 }
 
@@ -58,6 +60,8 @@
   --perf-cpu: #bc4c00;
   --scroll: #c4ccd4;
   --edit: #b26a00;
+  --hit: rgba(9, 105, 218, 0.18);
+  --hit-active: rgba(178, 106, 0, 0.32);
   color-scheme: light;
 }
 
@@ -88,6 +92,8 @@
   --perf-cpu: #ffd700;
   --scroll: #777777;
   --edit: #ff9500;
+  --hit: rgba(28, 126, 214, 0.4);
+  --hit-active: rgba(255, 149, 0, 0.45);
   color-scheme: dark;
 }
 
@@ -551,6 +557,18 @@ body {
    因此 .bs.s/.bs.v 的选择/悬停背景在下面仍然可见 */
 .bs.mark {
   background-image: linear-gradient(var(--mark), var(--mark));
+}
+
+/* 搜索命中：与 .bs.mark 相同的叠加机制（画在选择/悬停背景之上）；
+   置于 .bs.mark 之后，同一字节同时命中与被标记时命中色优先 */
+.bs.hit {
+  background-image: linear-gradient(var(--hit), var(--hit));
+}
+
+/* 活跃命中：更明显的颜色 + 左侧标记线（box-shadow 不占布局，不破坏列对齐） */
+.bs.hit-active {
+  background-image: linear-gradient(var(--hit-active), var(--hit-active));
+  box-shadow: inset 2px 0 0 var(--edit);
 }
 
 /* 偏移列的书签圆点：固定槽位保证所有行偏移文字对齐 */
@@ -2009,3 +2027,314 @@ body {
   font-size: 10.5px;
   color: var(--dim);
 }
+
+/* ============ v1.1.2：查找替换 / 填充 / 粘贴 / 数据检查器 / 最近文件 / 拖拽 / 右键菜单 ============ */
+
+/* ---- 工具栏：最近文件按钮 + 替换面板 ---- */
+.open-anchor {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+}
+
+.open-anchor .btn.primary {
+  border-top-right-radius: 0;
+  border-bottom-right-radius: 0;
+}
+
+.open-recent {
+  border-top-left-radius: 0;
+  border-bottom-left-radius: 0;
+  margin-left: -1px;
+  padding: 0 7px;
+  font-size: 10px;
+}
+
+/* 替换面板锚点（面板相对搜索组绝对定位） */
+.search-anchor {
+  position: relative;
+  display: flex;
+  align-items: center;
+}
+
+.replace-pop {
+  position: absolute;
+  top: calc(100% + 8px);
+  left: 0;
+  z-index: 60;
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto auto;
+  align-items: center;
+  gap: 6px;
+  padding: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.25);
+}
+
+.replace-input {
+  min-width: 0;
+  font-size: 12px;
+}
+
+.replace-hint {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  line-height: 1.4;
+  color: var(--err);
+}
+
+.replace-hint:not(.err) {
+  color: var(--dim);
+}
+
+/* ---- 最近文件下拉（portal 到 body，fixed 定位） ---- */
+.recent-pop {
+  position: fixed;
+  z-index: 90;
+  min-width: 300px;
+  max-width: 440px;
+  padding: 5px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.3);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.recent-title {
+  font-size: 11px;
+  color: var(--dim);
+  padding: 3px 8px 5px;
+  letter-spacing: 1px;
+}
+
+.recent-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  padding: 5px 8px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  cursor: pointer;
+  text-align: left;
+  min-width: 0;
+}
+
+.recent-item:hover {
+  background: var(--hover-bg);
+}
+
+.recent-name {
+  font-size: 12.5px;
+  color: var(--text);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-path {
+  font-size: 10.5px;
+  color: var(--dim);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.recent-clear {
+  margin-top: 3px;
+  padding: 5px 8px;
+  background: none;
+  border: none;
+  border-top: 1px solid var(--border);
+  border-radius: 0 0 4px 4px;
+  color: var(--dim);
+  font-size: 11.5px;
+  cursor: pointer;
+  text-align: center;
+}
+
+.recent-clear:hover {
+  color: var(--err);
+}
+
+/* ---- 右键菜单（portal 到 body，fixed 定位） ---- */
+.ctx-menu {
+  position: fixed;
+  z-index: 100;
+  min-width: 190px;
+  padding: 4px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  box-shadow: 0 8px 22px rgba(0, 0, 0, 0.3);
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.ctx-item {
+  padding: 5px 12px;
+  background: none;
+  border: none;
+  border-radius: 4px;
+  color: var(--text);
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+
+.ctx-item:hover:not(:disabled) {
+  background: var(--accent);
+  color: var(--accent-fg);
+}
+
+.ctx-item:disabled {
+  color: var(--dim);
+  opacity: 0.55;
+  cursor: default;
+}
+
+.ctx-sep {
+  height: 1px;
+  margin: 3px 6px;
+  background: var(--border);
+}
+
+/* ---- 拖拽打开提示层（覆盖全窗口，不影响事件流转） ---- */
+.drag-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 200;
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  border: 2px dashed var(--accent);
+  pointer-events: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.drag-overlay-inner {
+  font-size: 26px;
+  font-weight: 600;
+  letter-spacing: 3px;
+  color: var(--accent-fg);
+  background: var(--accent);
+  padding: 16px 38px;
+  border-radius: 10px;
+  box-shadow: 0 10px 34px rgba(0, 0, 0, 0.35);
+}
+
+/* ---- 数据检查器 ---- */
+.insp-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  transition: opacity 0.12s ease;
+}
+
+.insp-body.stale {
+  opacity: 0.45;
+}
+
+.insp-group {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+.insp-group-title {
+  font-size: 10.5px;
+  color: var(--dim);
+  letter-spacing: 1px;
+  margin-bottom: 2px;
+}
+
+.insp-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 1.5px 0;
+  font-size: 11.5px;
+}
+
+.insp-row.dim .insp-label,
+.insp-row.dim .insp-value {
+  color: var(--dim);
+}
+
+.insp-label {
+  flex: none;
+  width: 82px;
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.insp-value {
+  flex: 1;
+  min-width: 0;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.insp-swatch {
+  flex: none;
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+}
+
+.insp-copy {
+  flex: none;
+  background: none;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  padding: 0 5px;
+  color: var(--dim);
+  font-size: 10.5px;
+  cursor: pointer;
+  visibility: hidden;
+}
+
+.insp-row:hover .insp-copy {
+  visibility: visible;
+}
+
+.insp-copy:hover {
+  color: var(--text);
+  border-color: var(--border);
+}
+
+.insp-copy:disabled {
+  visibility: hidden;
+  cursor: default;
+}
+
+/* ---- 填充对话框 ---- */
+.fill-input {
+  width: 110px;
+  text-transform: uppercase;
+  letter-spacing: 2px;
+}
+
+.fill-presets {
+  display: flex;
+  gap: 6px;
+  margin-top: 6px;
+}
+

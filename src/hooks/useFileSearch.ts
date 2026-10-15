@@ -40,8 +40,8 @@ export function useFileSearch(fileMeta: FileMeta | null) {
   }, []);
 
   const runSearch = useCallback(
-    async (mode: SearchMode, pattern: string, caseSensitive: boolean) => {
-      if (!fileMeta || !pattern.trim()) return;
+    async (mode: SearchMode, pattern: string, caseSensitive: boolean): Promise<SearchHit[]> => {
+      if (!fileMeta || !pattern.trim()) return [];
       const token = ++tokenRef.current;
       setState({
         running: true,
@@ -58,7 +58,7 @@ export function useFileSearch(fileMeta: FileMeta | null) {
           caseSensitive,
           maxResults: 10000,
         });
-        if (tokenRef.current !== token) return; // 已被新搜索 / 新文件取代
+        if (tokenRef.current !== token) return []; // 已被新搜索 / 新文件取代
         setState({
           running: false,
           progress: null,
@@ -67,8 +67,9 @@ export function useFileSearch(fileMeta: FileMeta | null) {
           finishedAt: Date.now(),
           truncated: results.length >= 10000,
         });
+        return results;
       } catch (err) {
-        if (tokenRef.current !== token) return;
+        if (tokenRef.current !== token) return [];
         const msg = String(err);
         if (msg.includes('已取消')) {
           setState(s => ({ ...s, running: false, progress: null }));
@@ -82,6 +83,7 @@ export function useFileSearch(fileMeta: FileMeta | null) {
             truncated: false,
           });
         }
+        return [];
       }
     },
     [fileMeta],

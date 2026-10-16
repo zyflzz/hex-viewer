@@ -20,6 +20,9 @@ const DEFAULT_CONFIG: DisplayConfig = {
   editMode: 'dialog',
   confirmSave: false,
   versionMode: 'auto',
+  byteGrouping: 4,
+  rowHighlight: true,
+  colHighlight: true,
 };
 
 function loadConfig(): DisplayConfig {
@@ -50,6 +53,15 @@ function loadConfig(): DisplayConfig {
       versionMode: (['auto', 'manual'] as VersionMode[]).includes(parsed.versionMode as VersionMode)
         ? (parsed.versionMode as VersionMode)
         : DEFAULT_CONFIG.versionMode,
+      byteGrouping: ([1, 2, 4, 8] as DisplayConfig['byteGrouping'][]).includes(
+        parsed.byteGrouping as DisplayConfig['byteGrouping'],
+      )
+        ? (parsed.byteGrouping as DisplayConfig['byteGrouping'])
+        : DEFAULT_CONFIG.byteGrouping,
+      rowHighlight:
+        typeof parsed.rowHighlight === 'boolean' ? parsed.rowHighlight : DEFAULT_CONFIG.rowHighlight,
+      colHighlight:
+        typeof parsed.colHighlight === 'boolean' ? parsed.colHighlight : DEFAULT_CONFIG.colHighlight,
     };
   } catch {
     return DEFAULT_CONFIG;
@@ -107,6 +119,18 @@ export function useDisplayConfig() {
     setConfig(c => ({ ...c, versionMode }));
   }, []);
 
+  const setByteGrouping = useCallback((byteGrouping: DisplayConfig['byteGrouping']) => {
+    setConfig(c => ({ ...c, byteGrouping }));
+  }, []);
+
+  const setRowHighlight = useCallback((rowHighlight: boolean) => {
+    setConfig(c => ({ ...c, rowHighlight }));
+  }, []);
+
+  const setColHighlight = useCallback((colHighlight: boolean) => {
+    setConfig(c => ({ ...c, colHighlight }));
+  }, []);
+
   return {
     config,
     setBytesPerRow,
@@ -118,5 +142,8 @@ export function useDisplayConfig() {
     setEditMode,
     setConfirmSave,
     setVersionMode,
+    setByteGrouping,
+    setRowHighlight,
+    setColHighlight,
   };
 }

@@ -53,6 +53,9 @@ interface ToolbarProps {
   onThemeChange: (v: DisplayConfig['theme']) => void;
   onToggleAscii: () => void;
   onEncodingChange: (v: TextEncoding) => void;
+  onByteGroupingChange: (v: DisplayConfig['byteGrouping']) => void;
+  onRowHighlightChange: (v: boolean) => void;
+  onColHighlightChange: (v: boolean) => void;
 }
 
 export function Toolbar(props: ToolbarProps) {
@@ -94,6 +97,9 @@ export function Toolbar(props: ToolbarProps) {
     onThemeChange,
     onToggleAscii,
     onEncodingChange,
+    onByteGroupingChange,
+    onRowHighlightChange,
+    onColHighlightChange,
   } = props;
 
   const [showSettings, setShowSettings] = useState(false);
@@ -383,7 +389,41 @@ export function Toolbar(props: ToolbarProps) {
                 </button>
               </div>
             </div>
-            <div className="settings-hint">Ctrl+滚轮 缩放 · Ctrl+F 搜索 · Ctrl+G 跳转 · 拖选字节后 Ctrl+C 复制 · Ctrl+Shift+V 粘贴 Hex</div>
+            <div className="settings-row">
+              <label>字节分组</label>
+              <div className="seg">
+                {([1, 2, 4, 8] as const).map(n => (
+                  <button
+                    key={n}
+                    className={config.byteGrouping === n ? 'on' : ''}
+                    title={n === 1 ? '不分组' : `每 ${n} 字节一组`}
+                    onClick={() => onByteGroupingChange(n)}
+                  >
+                    {n === 1 ? '无' : n}
+                  </button>
+                ))}
+              </div>
+            </div>
+            <div className="settings-row">
+              <label>行 / 列高亮</label>
+              <div className="seg">
+                <button
+                  className={config.rowHighlight ? 'on' : ''}
+                  title="光标所在行浅色高亮"
+                  onClick={() => onRowHighlightChange(!config.rowHighlight)}
+                >
+                  行
+                </button>
+                <button
+                  className={config.colHighlight ? 'on' : ''}
+                  title="光标所在列浅色高亮（纵向对齐参考）"
+                  onClick={() => onColHighlightChange(!config.colHighlight)}
+                >
+                  列
+                </button>
+              </div>
+            </div>
+            <div className="settings-hint">Ctrl+滚轮 缩放 · Ctrl+F 搜索 · Ctrl+G 跳转 · 拖选字节后 Ctrl+C 复制 · Ctrl+Shift+V 粘贴 Hex · Alt+←/→ 跳转历史</div>
           </div>
         )}
       </div>

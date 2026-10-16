@@ -27,6 +27,8 @@ memmap2 = "0.9.11"
 sysinfo = { version = "0.39.6", default-features = false, features = ["system"] }
 memchr = "2.8.3"
 sha2 = "0.10"
+md5 = "0.7"
+sha1 = "0.10"
 zstd = "0.13"
 
 

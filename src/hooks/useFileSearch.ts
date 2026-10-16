@@ -17,9 +17,9 @@ export interface SearchState {
 
 /**
  * 全文件搜索：Rust 侧 mmap + memchr 扫描，
- * 进度通过 search://progress 事件流式回传，可随时取消。
+ * 进度通过 search://progress 事件流式回传（按 tabId 过滤），可随时取消。
  */
-export function useFileSearch(fileMeta: FileMeta | null) {
+export function useFileSearch(tabId: string, fileMeta: FileMeta | null) {
   const [state, setState] = useState<SearchState>({
     running: false,
     progress: null,
@@ -32,12 +32,13 @@ export function useFileSearch(fileMeta: FileMeta | null) {
 
   useEffect(() => {
     const un = listen<SearchProgress>('search://progress', e => {
+      if (e.payload.tabId !== tabId) return; // 其他标签页的搜索进度
       setState(s => (s.running ? { ...s, progress: e.payload } : s));
     });
     return () => {
       un.then(f => f());
     };
-  }, []);
+  }, [tabId]);
 
   const runSearch = useCallback(
     async (mode: SearchMode, pattern: string, caseSensitive: boolean): Promise<SearchHit[]> => {
@@ -45,7 +46,7 @@ export function useFileSearch(fileMeta: FileMeta | null) {
       const token = ++tokenRef.current;
       setState({
         running: true,
-        progress: { searched: 0, total: fileMeta.size, hits: 0 },
+        progress: { tabId, searched: 0, total: fileMeta.size, hits: 0 },
         results: [],
         error: null,
         finishedAt: 0,
@@ -53,6 +54,7 @@ export function useFileSearch(fileMeta: FileMeta | null) {
       });
       try {
         const results = await invoke<SearchHit[]>('search', {
+          tabId,
           mode,
           pattern,
           caseSensitive,
@@ -86,18 +88,18 @@ export function useFileSearch(fileMeta: FileMeta | null) {
         return [];
       }
     },
-    [fileMeta],
+    [fileMeta, tabId],
   );
 
   const cancelSearch = useCallback(() => {
     tokenRef.current += 1;
-    invoke('cancel_search').catch(() => {});
+    invoke('cancel_search', { tabId }).catch(() => {});
     setState(s => ({ ...s, running: false, progress: null }));
-  }, []);
+  }, [tabId]);
 
   const clearSearch = useCallback(() => {
     tokenRef.current += 1;
-    invoke('cancel_search').catch(() => {});
+    invoke('cancel_search', { tabId }).catch(() => {});
     setState({
       running: false,
       progress: null,
@@ -106,7 +108,7 @@ export function useFileSearch(fileMeta: FileMeta | null) {
       finishedAt: 0,
       truncated: false,
     });
-  }, []);
+  }, [tabId]);
 
   // 切换文件时清空结果
   useEffect(() => {

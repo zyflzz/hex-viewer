@@ -28,7 +28,7 @@ function toBytes(res: unknown): Uint8Array {
  * 此前键用字节偏移、淘汰中心用索引，二者混用导致淘汰排序失真，
  * 会把当前可见的高偏移分片当作"远处"分片淘汰，造成滚动闪烁。
  */
-export function useFileWindow() {
+export function useFileWindow(tabId: string) {
   const [fileMeta, setFileMeta] = useState<FileMeta | null>(null);
   const [cacheVersion, setCacheVersion] = useState(0);
   const [cacheBytes, setCacheBytes] = useState(0);
@@ -76,7 +76,7 @@ export function useFileWindow() {
       pending.add(chunkIndex);
       setLoading(true);
       const length = Math.min(CHUNK_SIZE, size - chunkOffset);
-      invoke('read_chunk', { offset: chunkOffset, length })
+      invoke('read_chunk', { tabId, offset: chunkOffset, length })
         .then(res => {
           if (tokenRef.current !== token) return; // 已切换文件，丢弃
           pending.delete(chunkIndex);
@@ -97,9 +97,9 @@ export function useFileWindow() {
         .finally(() => {
           if (tokenRef.current !== token) return;
           if (pendingRef.current.size === 0) setLoading(false);
-        });
+        })
     },
-    [bumpCache],
+    [bumpCache, tabId],
   );
 
   /** 重置分片缓存并按新元数据预载（打开文件 / 保存后重新 mmap 共用） */
@@ -121,10 +121,10 @@ export function useFileWindow() {
   );
 
   const openFile = useCallback(async (path: string): Promise<FileMeta> => {
-    const meta = await invoke<FileMeta>('open_file', { path });
+    const meta = await invoke<FileMeta>('open_file', { path, tabId });
     resetChunks(meta);
     return meta;
-  }, [resetChunks]);
+  }, [resetChunks, tabId]);
 
   /**
    * 保证 [startByte, endByte] 覆盖的分片在缓存中（可见区立即加载，邻接区延迟预取）
@@ -203,7 +203,7 @@ export function useFileWindow() {
       } else {
         const length = Math.min(CHUNK_SIZE, size - chunkOffset);
         tasks.push(
-          invoke('read_chunk', { offset: chunkOffset, length })
+          invoke('read_chunk', { tabId, offset: chunkOffset, length })
             .then(res => {
               const data = toBytes(res);
               chunksRef.current.set(c, data);
@@ -221,7 +221,7 @@ export function useFileWindow() {
     await Promise.all(tasks);
     if (token !== tokenRef.current) throw new Error('文件已切换');
     return out;
-  }, []);
+  }, [tabId]);
 
   const closeFile = useCallback(() => {
     tokenRef.current += 1;

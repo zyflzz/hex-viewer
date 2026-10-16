@@ -2,7 +2,6 @@ import type { ReactNode } from 'react';
 import type { Bookmark, EditMode, FileMeta, SidebarTab } from '../types';
 import type { StatsState } from '../hooks/useFileStats';
 import type { SearchState } from '../hooks/useFileSearch';
-import type { PerfState } from '../hooks/usePerfMonitor';
 import type { EditOp } from '../hooks/useFileEdits';
 import { SidebarInfo } from './SidebarInfo';
 import { SidebarBookmarks } from './SidebarBookmarks';
@@ -68,8 +67,10 @@ interface SidebarProps {
   aiPane?: ReactNode;
   /** 当前会话消息数（AI 标签徽章，用户 + AI 回复） */
   aiCount: number;
-  // 性能（公共底部）
-  perf: PerfState;
+  /** 分析选项卡内容（字符串提取 + 校验和） */
+  analyzePane?: ReactNode;
+  /** 是否渲染性能监控（仅激活标签页订阅全局采样，隐藏标签页跳过 1Hz 重渲染） */
+  perfEnabled: boolean;
   cacheBytes: number;
   visibleRows: number;
 }
@@ -120,7 +121,8 @@ export function Sidebar(props: SidebarProps) {
     previewActive,
     aiPane,
     aiCount,
-    perf,
+    analyzePane,
+    perfEnabled,
     cacheBytes,
     visibleRows,
   } = props;
@@ -198,6 +200,14 @@ export function Sidebar(props: SidebarProps) {
           AI
           {aiCount > 0 && <span className="tab-badge">{aiCount > 99 ? '99+' : aiCount}</span>}
         </button>
+        <button
+          className={`sidebar-tab${activeTab === 'analyze' ? ' on' : ''}`}
+          role="tab"
+          aria-selected={activeTab === 'analyze'}
+          onClick={() => onTabChange('analyze')}
+        >
+          分析
+        </button>
       </div>
 
       <div className="sidebar-body">
@@ -262,15 +272,23 @@ export function Sidebar(props: SidebarProps) {
         >
           {aiPane}
         </div>
+        {/* 分析面板自带内部滚动（字符串区），外层 pane 不滚动：校验和固定在底部 */}
+        <div
+          className="sidebar-pane analyze-pane"
+          style={{ display: activeTab === 'analyze' ? 'flex' : 'none' }}
+        >
+          {analyzePane}
+        </div>
       </div>
 
-      <SidebarPerf
-        perf={perf}
-        cacheBytes={cacheBytes}
-        visibleRows={visibleRows}
-        totalRows={totalRows}
-        editCount={editCount}
-      />
+      {perfEnabled && (
+        <SidebarPerf
+          cacheBytes={cacheBytes}
+          visibleRows={visibleRows}
+          totalRows={totalRows}
+          editCount={editCount}
+        />
+      )}
     </aside>
   );
 }

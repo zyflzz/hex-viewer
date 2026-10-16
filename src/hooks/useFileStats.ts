@@ -13,12 +13,13 @@ export interface StatsState {
  * 后台全文件统计分析（可打印字符数 / 零字节 / 高位字节等），
  * 大文件扫描通过 analysis://progress 事件回报进度，不阻塞界面。
  */
-export function useFileStats(fileMeta: FileMeta | null) {
+export function useFileStats(tabId: string, fileMeta: FileMeta | null) {
   const [state, setState] = useState<StatsState>({ running: false, progress: 0, stats: null });
   const tokenRef = useRef(0);
 
   useEffect(() => {
     const un = listen<AnalysisProgress>('analysis://progress', e => {
+      if (e.payload.tabId !== tabId) return; // 其他标签页的统计进度
       const { searched, total } = e.payload;
       setState(s =>
         s.running ? { ...s, progress: total > 0 ? searched / total : 1 } : s,
@@ -27,16 +28,16 @@ export function useFileStats(fileMeta: FileMeta | null) {
     return () => {
       un.then(f => f());
     };
-  }, []);
+  }, [tabId]);
 
   useEffect(() => {
     if (!fileMeta || fileMeta.size === 0) {
-      setState({ running: false, progress: 0, stats: fileMeta ? { total: 0, printable: 0, control: 0, high: 0, zero: 0, line_breaks: 0 } : null });
+      setState({ running: false, progress: 0, stats: fileMeta ? { total: 0, printable: 0, control: 0, high: 0, zero: 0, lineBreaks: 0 } : null });
       return;
     }
     const token = ++tokenRef.current;
     setState({ running: true, progress: 0, stats: null });
-    invoke<FileStats>('analyze_file')
+    invoke<FileStats>('analyze_file', { tabId })
       .then(stats => {
         if (tokenRef.current !== token) return;
         setState({ running: false, progress: 1, stats });
@@ -49,19 +50,19 @@ export function useFileStats(fileMeta: FileMeta | null) {
         }
         setState(s => ({ ...s, running: false }));
       });
-  }, [fileMeta?.path, fileMeta?.size]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [tabId, fileMeta?.path, fileMeta?.size]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const reanalyze = useCallback(() => {
     if (!fileMeta) return;
     const token = ++tokenRef.current;
     setState({ running: true, progress: 0, stats: null });
-    invoke<FileStats>('analyze_file')
+    invoke<FileStats>('analyze_file', { tabId })
       .then(stats => {
         if (tokenRef.current !== token) return;
         setState({ running: false, progress: 1, stats });
       })
       .catch(() => setState(s => ({ ...s, running: false })));
-  }, [fileMeta]);
+  }, [fileMeta, tabId]);
 
   return { ...state, reanalyze };
 }

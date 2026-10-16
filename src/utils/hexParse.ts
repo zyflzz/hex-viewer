@@ -19,6 +19,72 @@ export function parseHexPattern(input: string): Uint8Array | null {
   return out;
 }
 
+// ---------- 查找替换共享校验（App 工具栏展示与 FileTab 替换执行共用） ----------
+
+/** 搜索模式 */
+export type ReplaceMode = 'text' | 'hex';
+
+/** 搜索内容字节长度（文本 = UTF-8 字节数，Hex = 解析结果长度；非法 -1，空 0） */
+export function computeSearchLen(mode: ReplaceMode, searchText: string): number {
+  if (mode === 'hex') {
+    const b = parseHexPattern(searchText);
+    return b ? b.length : -1;
+  }
+  return searchText.length > 0 ? encodeTextToBytes(searchText, 'utf-8').length : 0;
+}
+
+export interface ReplaceValidation {
+  /** 替换内容编码后的字节（校验通过时非 null） */
+  replaceBytes: Uint8Array | null;
+  /** 是否可执行替换（等长且格式合法） */
+  ok: boolean;
+  /** 校验失败原因（按钮禁用时展示），成功为 null */
+  hint: string | null;
+  /** 搜索内容字节长度（与 computeSearchLen 一致） */
+  searchLen: number;
+}
+
+/**
+ * 替换内容校验：与搜索内容等长（文本按 UTF-8 字节数、Hex 按解析字节数）才允许执行。
+ * 纯函数：App（工具栏提示）与 FileTab（替换方法）共用同一套规则。
+ */
+export function validateReplace(
+  mode: ReplaceMode,
+  searchText: string,
+  replaceText: string,
+): ReplaceValidation {
+  const searchLen = computeSearchLen(mode, searchText);
+  if (searchLen <= 0) {
+    const hint =
+      mode === 'hex' && searchText.trim() !== '' && !parseHexPattern(searchText)
+        ? '搜索内容不是有效的 Hex 字符串'
+        : null;
+    return { replaceBytes: null, ok: false, hint, searchLen };
+  }
+  if (replaceText.trim() === '') {
+    return { replaceBytes: null, ok: false, hint: '待输入替换内容', searchLen };
+  }
+  const bytes =
+    mode === 'hex' ? parseHexPattern(replaceText) : encodeTextToBytes(replaceText, 'utf-8');
+  if (!bytes || bytes.length === 0) {
+    return {
+      replaceBytes: null,
+      ok: false,
+      hint: mode === 'hex' ? '替换内容不是有效的 Hex 字符串' : '替换内容为空',
+      searchLen,
+    };
+  }
+  if (bytes.length !== searchLen) {
+    return {
+      replaceBytes: null,
+      ok: false,
+      hint: `替换内容长度必须与搜索内容一致（${searchLen} 字节）`,
+      searchLen,
+    };
+  }
+  return { replaceBytes: bytes, ok: true, hint: null, searchLen };
+}
+
 // ---------- 文本编码（粘贴文本用） ----------
 
 const utf8Encoder = new TextEncoder();

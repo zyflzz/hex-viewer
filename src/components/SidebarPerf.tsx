@@ -1,4 +1,4 @@
-import type { PerfState } from '../hooks/usePerfMonitor';
+import { usePerf } from '../hooks/usePerfMonitor';
 import { formatNumber } from '../utils/format';
 
 /** 迷你趋势图（SVG 折线） */
@@ -29,7 +29,6 @@ function Sparkline({ data, color }: { data: number[]; color: string }) {
 }
 
 interface SidebarPerfProps {
-  perf: PerfState;
   cacheBytes: number;
   visibleRows: number;
   totalRows: number;
@@ -37,8 +36,9 @@ interface SidebarPerfProps {
   editCount: number;
 }
 
-/** 性能监控：固定在侧栏底部，所有选项卡共享 */
-export function SidebarPerf({ perf, cacheBytes, visibleRows, totalRows, editCount }: SidebarPerfProps) {
+/** 性能监控：固定在侧栏底部，所有选项卡共享；内存/CPU 取自全局采样 store */
+export function SidebarPerf({ cacheBytes, visibleRows, totalRows, editCount }: SidebarPerfProps) {
+  const perf = usePerf();
   return (
     <div className="sidebar-perf">
       <h3>性能监控</h3>

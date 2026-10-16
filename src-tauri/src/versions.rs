@@ -243,16 +243,10 @@ fn scan_base(base_path: &Path, mmap: &[u8], wanted: &HashSet<u64>) -> Result<Bas
 
 /// 校验文件已打开且路径匹配；返回其句柄
 fn require_opened(state: &State<'_, AppState>, file_path: &str) -> Result<Arc<OpenedFile>, String> {
-    let opened = state
-        .file
-        .lock()
-        .unwrap()
-        .clone()
-        .ok_or("尚未打开文件")?;
-    if !opened.matches_path(file_path) {
-        return Err("文件路径与当前打开的文件不一致".into());
-    }
-    Ok(opened)
+    // 多标签页：同一文件不会出现在两个标签页，按路径在映射中查找
+    state
+        .find_by_path(file_path)
+        .ok_or_else(|| "文件尚未在已打开的标签页中".into())
 }
 
 /// 记录版本的核心流程（阻塞线程内执行）：

@@ -16,7 +16,7 @@ function DistBar({ stats }: { stats: FileStats }) {
   const total = Math.max(stats.total, 1);
   const segs: Array<[string, number, string]> = [
     ['printable', stats.printable, '可打印'],
-    ['lb', stats.line_breaks, '换行'],
+    ['lb', stats.lineBreaks, '换行'],
     ['ctrl', stats.control, '控制'],
     ['high', stats.high, '高位'],
     ['zero', stats.zero, '零字节'],
@@ -77,7 +77,7 @@ export function SidebarInfo({ meta, stats, totalRows }: SidebarInfoProps) {
           <div className="info-list">
             <DistBar stats={stats.stats} />
             <InfoItem label="可打印字符" value={formatNumber(stats.stats.printable)} />
-            <InfoItem label="换行符" value={formatNumber(stats.stats.line_breaks)} />
+            <InfoItem label="换行符" value={formatNumber(stats.stats.lineBreaks)} />
             <InfoItem label="控制字符" value={formatNumber(stats.stats.control)} />
             <InfoItem label="高位字节" value={formatNumber(stats.stats.high)} />
             <InfoItem label="零字节" value={formatNumber(stats.stats.zero)} />

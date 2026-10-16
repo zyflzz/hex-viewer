@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useSyncExternalStore } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import type { PerfInfo } from '../types';
 
@@ -10,39 +10,55 @@ export interface PerfState {
   cpuHistory: number[]; // %
 }
 
-/** 1Hz 轮询进程内存 / CPU 占用，保留历史用于迷你趋势图 */
-export function usePerfMonitor(enabled: boolean): PerfState {
-  const [state, setState] = useState<PerfState>({
-    current: null,
-    memoryHistory: [],
-    cpuHistory: [],
-  });
+/**
+ * 模块级性能采样 store（useSyncExternalStore 单例）：
+ * 多标签页架构下每个 FileTab 的侧栏都会展示性能监控，
+ * 若各自 useState 轮询会导致隐藏标签页每秒无谓重渲染、且产生 N 个轮询循环。
+ * 这里全局只跑一个 1Hz 轮询（首个订阅者启动，最后一个取消时停止），
+ * 所有订阅组件共享同一快照。隐藏标签页通过条件渲染不订阅（见 Sidebar perfEnabled）。
+ */
 
-  useEffect(() => {
-    if (!enabled) {
-      setState({ current: null, memoryHistory: [], cpuHistory: [] });
-      return;
-    }
-    let alive = true;
-    const tick = () => {
-      invoke<PerfInfo>('get_perf')
-        .then(p => {
-          if (!alive) return;
-          setState(prev => ({
-            current: p,
-            memoryHistory: [...prev.memoryHistory, p.memory / 1024 / 1024].slice(-SAMPLES),
-            cpuHistory: [...prev.cpuHistory, p.cpu].slice(-SAMPLES),
-          }));
-        })
-        .catch(() => {});
-    };
+let state: PerfState = { current: null, memoryHistory: [], cpuHistory: [] };
+const listeners = new Set<() => void>();
+let timer: number | null = null;
+
+function emit() {
+  for (const l of listeners) l();
+}
+
+function tick() {
+  invoke<PerfInfo>('get_perf')
+    .then(p => {
+      state = {
+        current: p,
+        memoryHistory: [...state.memoryHistory, p.memory / 1024 / 1024].slice(-SAMPLES),
+        cpuHistory: [...state.cpuHistory, p.cpu].slice(-SAMPLES),
+      };
+      emit();
+    })
+    .catch(() => {});
+}
+
+function subscribe(listener: () => void): () => void {
+  listeners.add(listener);
+  if (timer === null) {
     tick();
-    const timer = window.setInterval(tick, 1000);
-    return () => {
-      alive = false;
+    timer = window.setInterval(tick, 1000);
+  }
+  return () => {
+    listeners.delete(listener);
+    if (listeners.size === 0 && timer !== null) {
       window.clearInterval(timer);
-    };
-  }, [enabled]);
+      timer = null;
+    }
+  };
+}
 
+function getSnapshot(): PerfState {
   return state;
+}
+
+/** 订阅全局性能采样（1Hz，进程级内存 / CPU + 历史趋势） */
+export function usePerf(): PerfState {
+  return useSyncExternalStore(subscribe, getSnapshot);
 }

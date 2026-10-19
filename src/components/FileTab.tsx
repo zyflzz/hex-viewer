@@ -16,13 +16,14 @@ import { StatusBar } from './StatusBar';
 import { EditDialog } from './EditDialog';
 import { ConfirmDialog } from './ConfirmDialog';
 import { FillDialog } from './FillDialog';
+import { InsertDialog } from './InsertDialog';
 import { ContextMenu, type ContextMenuEntry } from './ContextMenu';
 import { DataInspector } from './DataInspector';
 import { SidebarVersions } from './SidebarVersions';
 import { SidebarAi } from './SidebarAi';
 import { SidebarAnalyze } from './SidebarAnalyze';
 import { useFileWindow } from '../hooks/useFileWindow';
-import { useFileEdits } from '../hooks/useFileEdits';
+import { useFileEdits, type StructAction } from '../hooks/useFileEdits';
 import { useFileSearch, type SearchMode } from '../hooks/useFileSearch';
 import { useFileStats } from '../hooks/useFileStats';
 import { useFileBookmarks } from '../hooks/useFileBookmarks';
@@ -33,7 +34,9 @@ import type { AiConfig } from '../hooks/useAiConfig';
 import { streamChat, type ApiChatMessage } from '../utils/aiClient';
 import { buildAiContext } from '../utils/aiContext';
 import type {
+  AutosaveInfo,
   Bookmark,
+  CommandDef,
   DisplayConfig,
   FileMeta,
   FileTabStatus,
@@ -95,6 +98,18 @@ export interface FileTabHandle {
   redo(): void;
   copySelection(mode: 'hex' | 'text', encoding?: TextEncoding): void;
   paste(kind: 'hex' | 'text'): void;
+  /** Insert 键：光标处弹插入对话框 */
+  insert(): void;
+  /** Delete 键：删除选中区间 / 光标处单字节 */
+  deleteSelection(): void;
+  /** Ctrl+X：剪切选中区间（复制 + 删除） */
+  cut(): void;
+  /** Ctrl+Shift+Insert：把剪贴板内容插入到光标处 */
+  insertFromClipboard(): void;
+  /** 命令面板：本文件可执行的命令列表（随状态派生） */
+  listCommands(): CommandDef[];
+  /** 命令面板：执行命令 */
+  runCommand(id: string): void;
   toggleBookmarkAtCursor(): void;
   addMarkFromSelection(): void;
   jumpBookmarkRelative(dir: 1 | -1): void;
@@ -193,14 +208,40 @@ export const FileTab = memo(
       ensureRange,
       getBytes,
       readRange,
+      setVirtualSize,
+      invalidateAll,
     } = useFileWindow(tabId);
     const search = useFileSearch(tabId, fileMeta);
     const stats = useFileStats(tabId, fileMeta);
     const bm = useFileBookmarks(fileMeta);
-    const edit = useFileEdits(fileMeta);
-    const ver = useFileVersions(fileMeta, edit);
+    const edit = useFileEdits(tabId, fileMeta);
+    // 版本恢复需要读取"所见即所得"字节；该函数定义在下方（依赖 displayEdits），
+    // 经 ref 解除声明顺序环，调用时始终取到最新实现
+    const readDisplayRef = useRef<(offset: number, len: number) => Promise<Uint8Array>>(
+      async () => new Uint8Array(0),
+    );
+    const ver = useFileVersions(tabId, fileMeta, {
+      edits: edit.edits,
+      ops: edit.ops,
+      pos: edit.pos,
+      applyEdit: edit.applyEdit,
+      applyComposite: edit.applyComposite,
+      readDisplayRange: (o, l) => readDisplayRef.current(o, l),
+    });
     const aiChat = useAiChat(fileMeta);
     const strings = useStringExtract(tabId, fileMeta);
+
+    // ---------- 显示大小（虚拟偏移语义） ----------
+
+    /** 显示大小 = 磁盘大小 + 未保存结构编辑增量（插入 + / 删除 -） */
+    const displaySize = (fileMeta?.size ?? 0) + edit.virtualDelta;
+    /** 显示用元数据（大小为虚拟大小）：主视图 / 跳转 / 光标钳制 / 检查器都以它为准 */
+    const displayMeta = useMemo(
+      () => (fileMeta ? { ...fileMeta, size: displaySize } : null),
+      [fileMeta, displaySize],
+    );
+    /** 偏移显示位数（按显示大小，插入足够内容后自动加宽） */
+    const digits = offsetDigits(displaySize);
 
     const [aiGenerating, setAiGenerating] = useState(false);
     const [aiClearConfirmOpen, setAiClearConfirmOpen] = useState(false);
@@ -220,8 +261,9 @@ export const FileTab = memo(
       last: 0,
     });
 
-    // 填充对话框 / 右键菜单 / "从此处开始选择"锚点
+    // 填充对话框 / 插入对话框 / 右键菜单 / "从此处开始选择"锚点
     const [fillRange, setFillRange] = useState<{ start: number; end: number } | null>(null);
+    const [insertAt, setInsertAt] = useState<number | null>(null);
     const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; offset: number } | null>(null);
     const [selectionAnchor, setSelectionAnchor] = useState<number | null>(null);
 
@@ -240,21 +282,161 @@ export const FileTab = memo(
 
     const flashTimerRef = useRef<number | null>(null);
 
-    const totalRows = fileMeta ? Math.ceil(fileMeta.size / config.bytesPerRow) : 0;
+    const totalRows = displaySize > 0 ? Math.ceil(displaySize / config.bytesPerRow) : 0;
     const visibleRows = Math.max(0, visibleRange.last - visibleRange.first + 1);
 
     // ---------- 挂载即打开文件（path 生命周期内不变） ----------
+
+    /** 打开时检测到的崩溃恢复快照（三选一对话框） */
+    const [autosavePrompt, setAutosavePrompt] = useState<AutosaveInfo | null>(null);
 
     useEffect(() => {
       openFile(path)
         .then(meta => {
           // 光标初始设在偏移 0；空文件不显示光标
           setCursorOffset(meta.size > 0 ? 0 : null);
+          // 崩溃恢复检测：存在未保存编辑的自动保存时弹三选一
+          invoke<AutosaveInfo | null>('load_autosave', { filePath: path })
+            .then(info => {
+              if (info && info.payload && Array.isArray(info.payload.ops) && info.payload.ops.length > 0) {
+                setAutosavePrompt(info);
+              }
+            })
+            .catch(() => {/* 检测失败不影响打开 */});
         })
         .catch(err => {
           onOpenFailed(tabId, path, String(err));
         });
     }, [openFile, path, tabId, onOpenFailed]);
+
+    // ---------- 结构性编辑跟随（插入 / 删除 / 撤销重做后） ----------
+
+    /** 已处理过的结构性变更纪元（epoch 单调递增，防 effect 重入） */
+    const structEpochRef = useRef(0);
+
+    useEffect(() => {
+      const sc = edit.structChange;
+      if (!sc || sc.epoch === structEpochRef.current) return;
+      structEpochRef.current = sc.epoch;
+      if (!fileMeta) return;
+
+      // 光标 / 选择端点：穿过全部动作链式重映射（插入点之后 +N；删除区间内收缩到删除点，其后 -N）
+      const remapCursor = (o: number, a: StructAction): number => {
+        if (a.kind === 'insert') return o >= a.offset ? o + a.length : o;
+        if (o >= a.offset + a.length) return o - a.length;
+        if (o >= a.offset) return a.offset;
+        return o;
+      };
+      const chain = (o: number): number => {
+        for (const a of sc.actions) o = remapCursor(o, a);
+        return o;
+      };
+      if (cursorOffset !== null) setCursorOffset(Math.min(chain(cursorOffset), Math.max(0, displaySize - 1)));
+      if (selection) {
+        const s = chain(selection.start);
+        const e = chain(selection.end);
+        setSelection({ start: Math.min(s, e), end: Math.min(Math.max(s, e), Math.max(0, displaySize - 1)) });
+      }
+      if (activeHitOffset !== null) setActiveHitOffset(null);
+      if (flashOffset !== null) setFlashOffset(null);
+
+      // 书签：点书签落在删除区间内 → 删除；其余端点按光标规则重映射
+      for (const b of bm.sorted) {
+        if (b.start === b.end) {
+          let o: number | null = b.start;
+          for (const a of sc.actions) {
+            if (a.kind === 'insert') {
+              if (o !== null && o >= a.offset) o += a.length;
+            } else if (o !== null) {
+              if (o >= a.offset + a.length) o -= a.length;
+              else if (o >= a.offset) o = null;
+            }
+          }
+          if (o === null) bm.removeBookmark(b.id);
+          else if (o !== b.start) bm.updateBookmark(b.id, { start: o, end: o });
+        } else {
+          const s = chain(b.start);
+          const e = chain(b.end);
+          if (s !== b.start || e !== b.end) {
+            bm.updateBookmark(b.id, { start: Math.min(s, e), end: Math.min(Math.max(s, e), Math.max(0, displaySize - 1)) });
+          }
+        }
+      }
+
+      // 分片缓存全量失效（字节已平移）+ 虚拟大小更新 + 重新拉取可见区
+      setVirtualSize(displaySize);
+      invalidateAll();
+      const rb = config.bytesPerRow;
+      ensureRange(visibleRange.first * rb, (visibleRange.last + 1) * rb - 1);
+
+      // 搜索命中的偏移已过期，清空并提示重新搜索（与"替换后结果过期"一致）
+      if (search.results.length > 0) {
+        search.clearSearch();
+        showToast('内容长度已变化，搜索结果已清空，请重新搜索');
+      }
+    }, [
+      edit.structChange,
+      fileMeta,
+      displaySize,
+      cursorOffset,
+      selection,
+      activeHitOffset,
+      flashOffset,
+      bm,
+      setVirtualSize,
+      invalidateAll,
+      ensureRange,
+      config.bytesPerRow,
+      visibleRange,
+      search,
+      showToast,
+    ]);
+
+    // ---------- 崩溃恢复：编辑后防抖写盘 autosave（zstd 压缩，后端限 32 文件 / 50MB） ----------
+
+    const autosaveTimerRef = useRef<number | null>(null);
+    /** 本会话是否写入过 autosave（用于保存/放弃后精准清除） */
+    const autosaveWrittenRef = useRef(false);
+
+    useEffect(() => {
+      if (!fileMeta) return;
+      const snap = edit.getSnapshot();
+      const hasUnsaved = snap.pos > snap.diskOps;
+      if (!hasUnsaved) {
+        // 与磁盘对齐（保存成功 / 放弃 / 撤销回磁盘状态）：清掉自动保存
+        if (autosaveTimerRef.current !== null) {
+          window.clearTimeout(autosaveTimerRef.current);
+          autosaveTimerRef.current = null;
+        }
+        if (autosaveWrittenRef.current) {
+          autosaveWrittenRef.current = false;
+          invoke('clear_autosave', { filePath: fileMeta.path }).catch(() => {});
+        }
+        return;
+      }
+      if (autosaveTimerRef.current !== null) window.clearTimeout(autosaveTimerRef.current);
+      const path = fileMeta.path;
+      const payload = {
+        ops: snap.ops,
+        pos: snap.pos,
+        diskOps: snap.diskOps,
+        cursor: cursorOffset,
+        selection,
+      };
+      autosaveTimerRef.current = window.setTimeout(() => {
+        autosaveTimerRef.current = null;
+        autosaveWrittenRef.current = true;
+        invoke('save_autosave', { filePath: path, payload: { time: Date.now(), payload } }).catch(
+          err => console.error('自动保存失败:', err),
+        );
+      }, 2000);
+      return () => {
+        if (autosaveTimerRef.current !== null) {
+          window.clearTimeout(autosaveTimerRef.current);
+          autosaveTimerRef.current = null;
+        }
+      };
+    }, [fileMeta, edit.pos, edit.diskOps, edit.getSnapshot, cursorOffset, selection]);
 
     // ---------- 光标历史（Alt+←/→，仅内存，不持久化） ----------
 
@@ -267,7 +449,7 @@ export const FileTab = memo(
     /** 跳转到指定字节偏移（居中 + 闪烁高亮 + 光标同步 + 压入历史栈） */
     const jumpToOffset = useCallback(
       (offset: number, opts?: { noHistory?: boolean }) => {
-        const size = fileMeta?.size ?? 0;
+        const size = displaySize;
         if (size === 0) return;
         const target = Math.max(0, Math.min(offset, size - 1));
         if (!opts?.noHistory) {
@@ -286,7 +468,7 @@ export const FileTab = memo(
         if (flashTimerRef.current) window.clearTimeout(flashTimerRef.current);
         flashTimerRef.current = window.setTimeout(() => setFlashOffset(null), 1200);
       },
-      [fileMeta],
+      [displaySize],
     );
 
     /** Alt+←/→ 在两个栈间搬运当前位置 */
@@ -340,7 +522,7 @@ export const FileTab = memo(
     /** 跳转到书签/标记：点书签只跳转；范围标记同时选中整个区间 */
     const jumpToBookmark = useCallback(
       (target: Bookmark) => {
-        const size = fileMeta?.size ?? 0;
+        const size = displaySize;
         if (target.start >= size) {
           showToast('偏移超出文件末尾（文件可能已被修改）');
           return;
@@ -351,7 +533,7 @@ export const FileTab = memo(
         }
         jumpToOffset(target.start);
       },
-      [fileMeta, jumpToOffset, showToast],
+      [displaySize, jumpToOffset, showToast],
     );
 
     /** F2 / Shift+F2 在书签列表中循环导航 */
@@ -371,13 +553,12 @@ export const FileTab = memo(
     /** 分析选项卡：点击字符串 → 跳转并选中整串 */
     const jumpToString = useCallback(
       (hit: StringHit) => {
-        const size = fileMeta?.size ?? 0;
-        if (size === 0) return;
-        const end = Math.min(hit.offset + hit.length - 1, size - 1);
+        if (displaySize === 0) return;
+        const end = Math.min(hit.offset + hit.length - 1, displaySize - 1);
         setSelection({ start: hit.offset, end });
         jumpToOffset(hit.offset);
       },
-      [fileMeta, jumpToOffset],
+      [displaySize, jumpToOffset],
     );
 
     // ---------- 显示覆盖层 / 派生数据 ----------
@@ -406,6 +587,8 @@ export const FileTab = memo(
       },
       [readRange, displayEdits],
     );
+    // 供版本恢复（useFileVersions 经 EditsApi）取最新实现
+    readDisplayRef.current = readDisplayRange;
 
     /** 应用显示覆盖层的字节读取：无覆盖零拷贝；仅含覆盖的行拷贝替换（行宽 ≤32，常数开销） */
     const displayGetBytes = useCallback(
@@ -499,6 +682,8 @@ export const FileTab = memo(
         // 可视区间不会自动重新上报（未滚动/未重挂载），手动补拉
         const rb = config.bytesPerRow;
         ensureRange(visibleRange.first * rb, (visibleRange.last + 1) * rb - 1);
+        // 立即清除崩溃恢复快照（不等防抖 effect），避免"已保存但快照未清"的窗口
+        invoke('clear_autosave', { filePath: path }).catch(() => {});
         showToast('已保存');
         // 自动模式：保存成功后记录一个版本（只读文件不记录；与最新版本相同则静默跳过）
         if (config.versionMode === 'auto' && !meta.is_readonly) {
@@ -586,7 +771,7 @@ export const FileTab = memo(
      * - 直接模式：光标处字节进入行内编辑（无对话框）
      */
     const startEdit = useCallback(() => {
-      if (!fileMeta || fileMeta.size === 0) return;
+      if (!fileMeta || displaySize === 0) return;
       if (ver.previewing) {
         showToast('预览历史版本中，请先返回当前内容');
         return;
@@ -610,17 +795,17 @@ export const FileTab = memo(
         (cursorOffset !== null ? { start: cursorOffset, end: cursorOffset } : null);
       if (!range) return;
       setEditDialogRange(range);
-    }, [fileMeta, config.editMode, cursorOffset, selection, handleEditStart, ver.previewing, showToast]);
+    }, [fileMeta, displaySize, config.editMode, cursorOffset, selection, handleEditStart, ver.previewing, showToast]);
 
     const handleEditCommit = useCallback(
       (offset: number, oldValue: number, newValue: number) => {
         setDirectEditOffset(null);
         edit.applyEdit(
           [{ offset, oldValue, newValue }],
-          `@${hexOffset(offset, offsetDigits(fileMeta?.size ?? 0))} ${hexByte(oldValue)}→${hexByte(newValue)}`,
+          `@${hexOffset(offset, digits)} ${hexByte(oldValue)}→${hexByte(newValue)}`,
         );
       },
-      [edit, fileMeta],
+      [edit, digits],
     );
 
     const handleEditCancel = useCallback(() => {
@@ -629,9 +814,9 @@ export const FileTab = memo(
 
     // ---------- 查找替换 / 填充 / 粘贴 ----------
 
-    /** 可编辑判定（替换 / 填充 / 粘贴共用） */
+    /** 可编辑判定（替换 / 填充 / 粘贴 / 插入 / 删除共用；按显示大小判定） */
     const canEditNow =
-      !!fileMeta && fileMeta.size > 0 && !fileMeta.is_readonly && !ver.previewing;
+      !!fileMeta && displaySize > 0 && !fileMeta.is_readonly && !ver.previewing;
 
     /** 当前活跃命中：侧栏选择 > 光标所在命中 > 无 */
     const getActiveHit = useCallback(
@@ -683,13 +868,13 @@ export const FileTab = memo(
         }
         edit.applyEdit(
           changes,
-          `替换 @${hexOffset(hit.offset, offsetDigits(fileMeta!.size))} ${labelPart(args.searchText)}→${labelPart(args.replaceText)}`,
+          `替换 @${hexOffset(hit.offset, digits)} ${labelPart(args.searchText)}→${labelPart(args.replaceText)}`,
         );
         search.clearSearch();
         setActiveHitOffset(null);
         showToast('已替换，内容已变更，请重新搜索');
       },
-      [canEditNow, ver.previewing, search, getActiveHit, readDisplayRange, edit, fileMeta, showToast],
+      [canEditNow, ver.previewing, search, getActiveHit, readDisplayRange, edit, digits, showToast],
     );
 
     /** 替换下一个：先替换当前，再跳到下一个命中（结果保留，其余命中仍有效） */
@@ -721,7 +906,7 @@ export const FileTab = memo(
         if (changes.length > 0) {
           edit.applyEdit(
             changes,
-            `替换 @${hexOffset(hit.offset, offsetDigits(fileMeta!.size))} ${labelPart(args.searchText)}→${labelPart(args.replaceText)}`,
+            `替换 @${hexOffset(hit.offset, digits)} ${labelPart(args.searchText)}→${labelPart(args.replaceText)}`,
           );
         }
         const idx = rs.findIndex(r => r.offset === hit.offset);
@@ -738,7 +923,7 @@ export const FileTab = memo(
         getActiveHit,
         readDisplayRange,
         edit,
-        fileMeta,
+        digits,
         jumpToOffset,
         showToast,
       ],
@@ -817,7 +1002,7 @@ export const FileTab = memo(
 
     /** 填充入口：校验后弹对话框（无选中时提示） */
     const startFill = useCallback(() => {
-      if (!fileMeta || fileMeta.size === 0) return;
+      if (!fileMeta || displaySize === 0) return;
       if (ver.previewing) {
         showToast('预览历史版本中，请先返回当前内容');
         return;
@@ -831,14 +1016,14 @@ export const FileTab = memo(
         return;
       }
       setFillRange({ start: selection.start, end: selection.end });
-    }, [fileMeta, selection, ver.previewing, showToast]);
+    }, [fileMeta, displaySize, selection, ver.previewing, showToast]);
 
     /** 填充提交：跳过已等于填充值的字节 */
     const commitFill = useCallback(
       async (value: number) => {
         const range = fillRange;
         setFillRange(null);
-        if (!range || !fileMeta) return;
+        if (!range) return;
         const len = range.end - range.start + 1;
         const old = await readDisplayRange(range.start, len);
         const changes: Array<{ offset: number; oldValue: number; newValue: number }> = [];
@@ -851,13 +1036,12 @@ export const FileTab = memo(
           showToast('内容无变化（区间已是该值）');
           return;
         }
-        const d = offsetDigits(fileMeta.size);
         edit.applyEdit(
           changes,
-          `填充 @${hexOffset(range.start, d)}–${hexOffset(range.end, d)} = ${hexByte(value)}（${len} 字节）`,
+          `填充 @${hexOffset(range.start, digits)}–${hexOffset(range.end, digits)} = ${hexByte(value)}（${len} 字节）`,
         );
       },
-      [fillRange, fileMeta, readDisplayRange, edit, showToast],
+      [fillRange, readDisplayRange, edit, digits, showToast],
     );
 
     /**
@@ -866,7 +1050,7 @@ export const FileTab = memo(
      */
     const pasteFromClipboard = useCallback(
       async (kind: 'hex' | 'text', targetOverride?: number) => {
-        if (!fileMeta || fileMeta.size === 0) return;
+        if (!fileMeta || displaySize === 0) return;
         if (ver.previewing) {
           showToast('预览历史版本中，请先返回当前内容');
           return;
@@ -899,7 +1083,7 @@ export const FileTab = memo(
           );
           return;
         }
-        const maxLen = fileMeta.size - target;
+        const maxLen = displaySize - target;
         if (maxLen <= 0) {
           showToast('目标位置已到文件末尾');
           return;
@@ -916,15 +1100,140 @@ export const FileTab = memo(
         if (changes.length > 0) {
           edit.applyEdit(
             changes,
-            `粘贴 @${hexOffset(target, offsetDigits(fileMeta.size))}（${take} 字节）`,
+            `粘贴 @${hexOffset(target, digits)}（${take} 字节）`,
           );
         } else if (!truncated) {
           showToast('内容无变化');
         }
         if (truncated) showToast('粘贴内容超出文件末尾，已截断');
       },
-      [fileMeta, ver.previewing, cursorOffset, selection, config.encoding, readDisplayRange, edit, showToast],
+      [fileMeta, displaySize, digits, ver.previewing, cursorOffset, selection, config.encoding, readDisplayRange, edit, showToast],
     );
+
+    // ---------- 插入 / 删除 / 剪切（可变长度编辑） ----------
+
+    /** 结构编辑前置校验（插入 / 删除 / 剪切共用提示），返回 false 时已提示 */
+    const checkStructEditable = useCallback((): boolean => {
+      if (!fileMeta) return false;
+      if (fileMeta.is_readonly) {
+        showToast('文件为只读，无法编辑（可另存为）');
+        return false;
+      }
+      if (ver.previewing) {
+        showToast('预览历史版本中，请先返回当前内容');
+        return false;
+      }
+      return true;
+    }, [fileMeta, ver.previewing, showToast]);
+
+    /** 插入入口（Insert 键 / 侧栏按钮 / 右键菜单）：在光标/选择起点前弹插入对话框 */
+    const startInsert = useCallback(() => {
+      if (!checkStructEditable()) return;
+      const at = selection?.start ?? cursorOffset;
+      if (at === null || at === undefined) {
+        showToast('请先点击一个字节设置插入点');
+        return;
+      }
+      setInsertAt(Math.max(0, Math.min(at, displaySize)));
+      setActiveSidebarTab('edit');
+    }, [checkStructEditable, selection, cursorOffset, displaySize, showToast]);
+
+    /** 插入提交：新字节插在指定偏移之前（可 Ctrl+Z 撤销） */
+    const commitInsert = useCallback(
+      (bytes: number[], source: string) => {
+        const at = insertAt;
+        setInsertAt(null);
+        if (at === null || bytes.length === 0) return;
+        edit.applyInsert(at, bytes, `插入 @${hexOffset(at, digits)}（${bytes.length} 字节，${source}）`);
+        showToast(`已插入 ${bytes.length} 字节（可撤销）`);
+      },
+      [insertAt, edit, digits, showToast],
+    );
+
+    /** 删除区间（Delete 键 / 侧栏按钮 / 右键菜单）：选中区间或光标处单字节 */
+    const doDeleteRange = useCallback(async () => {
+      if (!checkStructEditable()) return;
+      if (displaySize === 0) return;
+      const range =
+        selection ?? (cursorOffset !== null ? { start: cursorOffset, end: cursorOffset } : null);
+      if (!range) {
+        showToast('请先点击一个字节或选择区间');
+        return;
+      }
+      const len = range.end - range.start + 1;
+      try {
+        const deleted = await readDisplayRange(range.start, len);
+        edit.applyDelete(
+          range.start,
+          Array.from(deleted),
+          `删除 @${hexOffset(range.start, digits)}（${len} 字节）`,
+        );
+        setSelection(null);
+        showToast(`已删除 ${len} 字节（可撤销）`);
+      } catch (err) {
+        console.error(err);
+        showToast('读取被删内容失败');
+      }
+    }, [checkStructEditable, displaySize, selection, cursorOffset, readDisplayRange, edit, digits, showToast]);
+
+    /** 剪切（Ctrl+X）：复制选中区间（Hex）后删除该区间 */
+    const doCut = useCallback(async () => {
+      if (!checkStructEditable()) return;
+      if (!selection) {
+        showToast('请先选择要剪切的区间');
+        return;
+      }
+      const len = selection.end - selection.start + 1;
+      if (len > MAX_COPY_BYTES) {
+        showToast(`选择过大（${len} 字节），上限 4MB`);
+        return;
+      }
+      try {
+        const data = await readDisplayRange(selection.start, len);
+        const parts = new Array<string>(data.length);
+        for (let i = 0; i < data.length; i++) parts[i] = hexByte(data[i]);
+        await writeClipboard(parts.join(' '));
+        edit.applyDelete(
+          selection.start,
+          Array.from(data),
+          `剪切 @${hexOffset(selection.start, digits)}（${len} 字节）`,
+        );
+        setSelection(null);
+        showToast(`已剪切 ${len} 字节（可撤销）`);
+      } catch (err) {
+        console.error(err);
+        showToast('剪切失败');
+      }
+    }, [checkStructEditable, selection, readDisplayRange, edit, digits, showToast]);
+
+    /** 从剪贴板插入（Ctrl+Shift+Insert）：Hex 优先解析，失败按显示编码当文本 */
+    const doInsertFromClipboard = useCallback(async () => {
+      if (!checkStructEditable()) return;
+      const at = cursorOffset ?? selection?.start ?? null;
+      if (at === null) {
+        showToast('请先点击一个字节设置插入点');
+        return;
+      }
+      let text: string;
+      try {
+        text = await navigator.clipboard.readText();
+      } catch {
+        showToast('读取剪贴板失败');
+        return;
+      }
+      if (!text) {
+        showToast('剪贴板为空');
+        return;
+      }
+      const bytes = parseHexPattern(text) ?? encodeTextToBytes(text, config.encoding);
+      if (!bytes || bytes.length === 0) {
+        showToast('剪贴板内容无法解析为字节');
+        return;
+      }
+      const list = Array.from(bytes);
+      edit.applyInsert(at, list, `插入 @${hexOffset(at, digits)}（剪贴板，${list.length} 字节）`);
+      showToast(`已插入 ${list.length} 字节（可撤销）`);
+    }, [checkStructEditable, cursorOffset, selection, config.encoding, edit, digits, showToast]);
 
     // ---------- 右键菜单 ----------
 
@@ -938,10 +1247,9 @@ export const FileTab = memo(
     const ctxEntries = useMemo<ContextMenuEntry[]>(() => {
       if (!ctxMenu) return [];
       const off = ctxMenu.offset;
-      const editable = !!fileMeta && fileMeta.size > 0 && !fileMeta.is_readonly && !ver.previewing;
+      const editable = !!fileMeta && displaySize > 0 && !fileMeta.is_readonly && !ver.previewing;
       const hasSel = selection !== null;
       const pointBm = bm.sorted.find(b => b.start === off && b.end === off);
-      const d = fileMeta ? offsetDigits(fileMeta.size) : 8;
       const item = (
         key: string,
         label: string,
@@ -964,6 +1272,18 @@ export const FileTab = memo(
           }
         }, !editable),
         item('fill', '填充选中区间', startFill, !editable || !hasSel),
+        item('insert', '在此处插入字节', () => {
+          setSelection(null);
+          setCursorOffset(off);
+          startInsert();
+        }, !editable),
+        item('insertClip', '在此处插入剪贴板内容', () => {
+          setSelection(null);
+          setCursorOffset(off);
+          void doInsertFromClipboard();
+        }, !editable),
+        item('delete', '删除选中区间', () => void doDeleteRange(), !editable),
+        item('cut', '剪切选中区间', () => void doCut(), !editable || !hasSel),
         { key: 'sep2', sep: true },
         pointBm
           ? item('delBm', '删除此处书签', () => bm.removeBookmark(pointBm.id))
@@ -974,12 +1294,12 @@ export const FileTab = memo(
         item('mark', '把选中区间标为标记', addMarkFromSelection, !hasSel),
         { key: 'sep3', sep: true },
         item('goto', '跳转到此偏移', () => {
-          onGotoFill(`0x${hexOffset(off, d)}`);
-        }, !fileMeta || fileMeta.size === 0),
+          onGotoFill(`0x${hexOffset(off, digits)}`);
+        }, !fileMeta || displaySize === 0),
         item('selFrom', '从此处开始选择', () => {
           setSelectionAnchor(off);
           showToast('已设置选择起点，点击另一字节完成选择');
-        }, !fileMeta || fileMeta.size === 0),
+        }, !fileMeta || displaySize === 0),
         { key: 'sep4', sep: true },
         item('ai', 'AI 分析选中内容', () => {
           setActiveSidebarTab('ai');
@@ -989,12 +1309,18 @@ export const FileTab = memo(
     }, [
       ctxMenu,
       fileMeta,
+      displaySize,
+      digits,
       selection,
       ver.previewing,
       bm,
       copySelection,
       pasteFromClipboard,
       startFill,
+      startInsert,
+      doInsertFromClipboard,
+      doDeleteRange,
+      doCut,
       addMarkFromSelection,
       config.editMode,
       handleEditStart,
@@ -1039,7 +1365,6 @@ export const FileTab = memo(
             }
           }
           if (changes.length) {
-            const digits = offsetDigits(fileMeta?.size ?? 0);
             const label =
               changes.length === 1
                 ? `@${hexOffset(range.start, digits)} ${hexByte(changes[0].oldValue)}→${hexByte(changes[0].newValue)}`
@@ -1051,7 +1376,7 @@ export const FileTab = memo(
           showToast('读取当前内容失败');
         }
       },
-      [editDialogRange, readRange, edit, showToast, fileMeta],
+      [editDialogRange, readRange, edit, digits, showToast],
     );
 
     /** 从操作记录撤销到指定操作：目标即最近一次直接执行，更早的先弹确认 */
@@ -1132,8 +1457,10 @@ export const FileTab = memo(
     const doRestoreVersion = useCallback(
       async (id: string) => {
         try {
-          const { changes, skipped } = await ver.restoreVersion(id);
-          if (changes === 0) {
+          const { changes, skipped, structural } = await ver.restoreVersion(id);
+          if (structural) {
+            showToast(`已恢复版本内容（长度有变化，可撤销）`);
+          } else if (changes === 0) {
             showToast(skipped > 0 ? `版本位置超出当前文件，已跳过 ${skipped} 处` : '当前内容与该版本一致');
           } else {
             showToast(
@@ -1170,7 +1497,7 @@ export const FileTab = memo(
           return;
         }
 
-        const fileSize = fileMeta.size;
+        const fileSize = displaySize;
         /** 读取光标处字节的显示值（原始内容 + 覆盖层） */
         const readDisplayByte = async (offset: number): Promise<number | null> => {
           if (offset < 0 || offset >= fileSize) return null;
@@ -1321,7 +1648,7 @@ export const FileTab = memo(
           setAiGenerating(false);
         }
       },
-      [aiGenerating, fileMeta, aiConfig, aiChat, selection, cursorOffset, readRange, displayEdits],
+      [aiGenerating, fileMeta, displaySize, aiConfig, aiChat, selection, cursorOffset, readRange, displayEdits],
     );
 
     /** 停止生成：中止流式请求，保留已生成内容 */
@@ -1424,7 +1751,7 @@ export const FileTab = memo(
           showToast('无效的偏移（支持 0x 前缀 Hex 或十进制）');
           return;
         }
-        if (parsed >= fileMeta.size) {
+        if (parsed >= displaySize) {
           showToast('偏移超出文件末尾');
           return;
         }
@@ -1434,6 +1761,132 @@ export const FileTab = memo(
       saveAs: () => void doSaveAs(),
       saveShortcut: handleSaveShortcut,
       startEdit,
+      insert: startInsert,
+      deleteSelection: () => void doDeleteRange(),
+      cut: () => void doCut(),
+      insertFromClipboard: () => void doInsertFromClipboard(),
+      listCommands: () => {
+        const cmds: CommandDef[] = [];
+        if (!fileMeta) return cmds;
+        const editable = displaySize > 0 && !fileMeta.is_readonly && !ver.previewing;
+        cmds.push(
+          { id: 'file.save', label: '保存', category: '文件', shortcut: 'Ctrl+S' },
+          { id: 'file.saveAs', label: '另存为', category: '文件', shortcut: 'Ctrl+Shift+S' },
+        );
+        if (editable) {
+          cmds.push(
+            { id: 'edit.startEdit', label: '编辑字节', category: '编辑', shortcut: 'Ctrl+E' },
+            { id: 'edit.insert', label: '插入字节', category: '编辑', shortcut: 'Insert' },
+            { id: 'edit.insertClipboard', label: '插入剪贴板内容', category: '编辑', shortcut: 'Ctrl+Shift+Insert' },
+            { id: 'edit.delete', label: '删除选中 / 单字节', category: '编辑', shortcut: 'Delete' },
+            { id: 'edit.cut', label: '剪切选中区间', category: '编辑', shortcut: 'Ctrl+X' },
+            { id: 'edit.copyHex', label: '复制 Hex', category: '编辑', shortcut: 'Ctrl+C' },
+            { id: 'edit.copyText', label: '复制文本', category: '编辑', shortcut: 'Ctrl+Shift+C' },
+            { id: 'edit.pasteHex', label: '粘贴 Hex', category: '编辑', shortcut: 'Ctrl+Shift+V' },
+            { id: 'edit.pasteText', label: '粘贴文本', category: '编辑' },
+            { id: 'edit.fill', label: '填充区间', category: '编辑' },
+          );
+        }
+        if (edit.canUndo) {
+          cmds.push({ id: 'edit.undo', label: '撤销', category: '编辑', shortcut: 'Ctrl+Z' });
+        }
+        if (edit.canRedo) {
+          cmds.push({ id: 'edit.redo', label: '恢复', category: '编辑', shortcut: 'Ctrl+Y' });
+        }
+        cmds.push(
+          { id: 'bm.toggle', label: '切换光标处书签', category: '书签', shortcut: 'Ctrl+B' },
+          { id: 'bm.mark', label: '把选择设为标记', category: '书签', shortcut: 'Ctrl+Shift+B' },
+          { id: 'bm.next', label: '下一个书签 / 标记', category: '书签', shortcut: 'F2' },
+          { id: 'bm.prev', label: '上一个书签 / 标记', category: '书签', shortcut: 'Shift+F2' },
+          { id: 'tab.info', label: '文件信息', category: '视图' },
+          { id: 'tab.bookmarks', label: '书签列表', category: '视图' },
+          { id: 'tab.search', label: '搜索与替换', category: '视图' },
+          { id: 'tab.edit', label: '编辑面板', category: '视图' },
+          { id: 'tab.versions', label: '历史版本', category: '视图' },
+          { id: 'tab.ai', label: 'AI 助手', category: '视图' },
+          { id: 'tab.analyze', label: '分析（字符串 / 熵图 / 直方图 / 校验和）', category: '视图' },
+        );
+        return cmds;
+      },
+      runCommand: (id: string) => {
+        switch (id) {
+          case 'file.save':
+            handleSaveShortcut();
+            break;
+          case 'file.saveAs':
+            void doSaveAs();
+            break;
+          case 'edit.startEdit':
+            startEdit();
+            break;
+          case 'edit.insert':
+            startInsert();
+            break;
+          case 'edit.insertClipboard':
+            void doInsertFromClipboard();
+            break;
+          case 'edit.delete':
+            void doDeleteRange();
+            break;
+          case 'edit.cut':
+            void doCut();
+            break;
+          case 'edit.copyHex':
+            void copySelection('hex');
+            break;
+          case 'edit.copyText':
+            void copySelection('text');
+            break;
+          case 'edit.pasteHex':
+            void pasteFromClipboard('hex');
+            break;
+          case 'edit.pasteText':
+            void pasteFromClipboard('text');
+            break;
+          case 'edit.fill':
+            startFill();
+            break;
+          case 'edit.undo':
+            if (!ver.previewing) edit.undoLast();
+            break;
+          case 'edit.redo':
+            if (!ver.previewing) edit.redoLast();
+            break;
+          case 'bm.toggle':
+            if (cursorOffset !== null && !ver.previewing) toggleBookmarkAtCursor(cursorOffset);
+            break;
+          case 'bm.mark':
+            addMarkFromSelection();
+            break;
+          case 'bm.next':
+            jumpBookmarkRelative(1);
+            break;
+          case 'bm.prev':
+            jumpBookmarkRelative(-1);
+            break;
+          case 'tab.info':
+            setActiveSidebarTab('info');
+            break;
+          case 'tab.bookmarks':
+            setActiveSidebarTab('bookmarks');
+            break;
+          case 'tab.search':
+            setActiveSidebarTab('search');
+            break;
+          case 'tab.edit':
+            setActiveSidebarTab('edit');
+            break;
+          case 'tab.versions':
+            setActiveSidebarTab('versions');
+            break;
+          case 'tab.ai':
+            setActiveSidebarTab('ai');
+            break;
+          case 'tab.analyze':
+            setActiveSidebarTab('analyze');
+            break;
+        }
+      },
       undo: () => {
         if (ver.previewing) return;
         edit.undoLast();
@@ -1446,7 +1899,7 @@ export const FileTab = memo(
       paste: kind => void pasteFromClipboard(kind),
       toggleBookmarkAtCursor: () => {
         if (ver.previewing) return;
-        if (cursorOffset !== null && fileMeta && cursorOffset < fileMeta.size) {
+        if (cursorOffset !== null && fileMeta && cursorOffset < displaySize) {
           toggleBookmarkAtCursor(cursorOffset);
         }
       },
@@ -1471,8 +1924,6 @@ export const FileTab = memo(
         (document.activeElement as HTMLElement | null)?.blur?.();
       },
     }));
-
-    const digits = offsetDigits(fileMeta?.size ?? 0);
 
     return (
       <div className={`tab-pane${active ? ' active' : ''}`}>
@@ -1506,11 +1957,11 @@ export const FileTab = memo(
                   </button>
                 </div>
               )}
-              {fileMeta ? (
+              {displayMeta ? (
                 <HexViewer
-                  key={`${fileMeta.path}::${fileMeta.size}`}
+                  key={displayMeta.path}
                   ref={hexViewerRef}
-                  meta={fileMeta}
+                  meta={displayMeta}
                   config={config}
                   cacheVersion={cacheVersion}
                   getBytes={displayGetBytes}
@@ -1551,7 +2002,7 @@ export const FileTab = memo(
             <Sidebar
               activeTab={activeSidebarTab}
               onTabChange={setActiveSidebarTab}
-              meta={fileMeta}
+              meta={displayMeta}
               stats={stats}
               totalRows={totalRows}
               bookmarks={bm.sorted}
@@ -1591,10 +2042,14 @@ export const FileTab = memo(
               onFill={startFill}
               onPasteHex={() => void pasteFromClipboard('hex')}
               onPasteText={() => void pasteFromClipboard('text')}
+              onInsert={startInsert}
+              onDeleteRange={() => void doDeleteRange()}
+              onCut={() => void doCut()}
+              onInsertFromClipboard={() => void doInsertFromClipboard()}
               inspector={
                 <DataInspector
                   offset={cursorOffset}
-                  fileSize={fileMeta?.size ?? 0}
+                  fileSize={displaySize}
                   readRange={readDisplayRange}
                   digits={digits}
                 />
@@ -1641,8 +2096,13 @@ export const FileTab = memo(
                   meta={fileMeta}
                   selection={selection}
                   digits={digits}
+                  stats={stats.stats}
                   strings={strings}
                   onJumpToString={jumpToString}
+                  onJumpToOffset={offset => {
+                    setSelection({ start: offset, end: offset });
+                    jumpToOffset(offset);
+                  }}
                   showToast={showToast}
                 />
               }
@@ -1653,7 +2113,7 @@ export const FileTab = memo(
           </div>
 
           <StatusBar
-            meta={fileMeta}
+            meta={displayMeta}
             hoverOffset={hoverOffset}
             cursorOffset={cursorOffset}
             selection={selection}
@@ -1686,6 +2146,54 @@ export const FileTab = memo(
             digits={digits}
             onCommit={v => void commitFill(v)}
             onCancel={() => setFillRange(null)}
+          />
+        )}
+
+        {/* 插入字节（Insert 键 / 侧栏按钮） */}
+        {insertAt !== null && fileMeta && (
+          <InsertDialog
+            offset={insertAt}
+            digits={digits}
+            encoding={config.encoding}
+            onCommit={commitInsert}
+            onCancel={() => setInsertAt(null)}
+          />
+        )}
+
+        {/* 崩溃恢复：检测到未保存编辑的自动保存 */}
+        {autosavePrompt && fileMeta && (
+          <ConfirmDialog
+            title="检测到未保存的编辑"
+            message={`${fileMeta.name} 在 ${new Date(autosavePrompt.time).toLocaleString('zh-CN', { hour12: false })} 有未保存编辑（上次可能异常退出），是否恢复？`}
+            buttons={[
+              {
+                label: '恢复',
+                kind: 'primary',
+                onClick: () => {
+                  const info = autosavePrompt;
+                  setAutosavePrompt(null);
+                  edit.restoreSnapshot(info.payload);
+                  if (info.payload.cursor !== null) setCursorOffset(info.payload.cursor);
+                  if (info.payload.selection) setSelection(info.payload.selection);
+                  showToast('已恢复未保存的编辑（可 Ctrl+Z 撤销）');
+                },
+              },
+              {
+                label: '丢弃',
+                kind: 'danger',
+                onClick: () => {
+                  setAutosavePrompt(null);
+                  invoke('clear_autosave', { filePath: fileMeta.path }).catch(() => {});
+                  showToast('已丢弃未保存的编辑');
+                },
+              },
+              {
+                label: '稍后',
+                kind: 'plain',
+                onClick: () => setAutosavePrompt(null),
+              },
+            ]}
+            onCancel={() => setAutosavePrompt(null)}
           />
         )}
 

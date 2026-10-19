@@ -1,16 +1,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
+import { createPortal } from 'react-dom';
 import { open as openFileDialog } from '@tauri-apps/plugin-dialog';
 import { Toolbar } from './components/Toolbar';
 import { TabBar, type TabBarItem } from './components/TabBar';
 import { FileTab, type FileTabHandle } from './components/FileTab';
+import { DiffTab } from './components/DiffTab';
 import { ConfirmDialog } from './components/ConfirmDialog';
+import { CommandPalette } from './components/CommandPalette';
 import { useDisplayConfig } from './hooks/useDisplayConfig';
 import { useRecentFiles } from './hooks/useRecentFiles';
 import { useAiConfig } from './hooks/useAiConfig';
 import type { SearchMode } from './hooks/useFileSearch';
-import type { FileTabStatus, TabInfo } from './types';
+import type { AnyTabInfo, CommandDef, FileTabStatus, TabInfo } from './types';
 import { validateReplace } from './utils/hexParse';
 import './App.css';
 
@@ -39,7 +42,8 @@ function App() {
 
   // ---------- 标签页管理 ----------
 
-  const [tabState, setTabState] = useState<{ tabs: TabInfo[]; activeId: string | null }>({
+  /** 标签列表：文件标签 + 对比标签（v1.1.4） */
+  const [tabState, setTabState] = useState<{ tabs: AnyTabInfo[]; activeId: string | null }>({
     tabs: [],
     activeId: null,
   });
@@ -100,8 +104,8 @@ function App() {
   /** 打开文件为新标签页：同文件已开则切换；预 invoke 校验失败不产生标签 */
   const openNewTab = useCallback(
     async (path: string) => {
-      // 同文件不允许双开：切到已有标签
-      const existing = tabStateRef.current.tabs.find(t => t.path === path);
+      // 同文件不允许双开：切到已有标签（对比标签持有重复路径，不参与该判断）
+      const existing = tabStateRef.current.tabs.find(t => 'path' in t && t.path === path);
       if (existing) {
         setTabState(s => ({ ...s, activeId: existing.id }));
         showToast('文件已打开');
@@ -199,6 +203,53 @@ function App() {
     gotoInputRef.current?.focus();
   }, []);
 
+  // ---------- 对比模式（v1.1.4） ----------
+
+  /** 对比文件选择对话框 */
+  const [compareOpen, setCompareOpen] = useState(false);
+  /** 纯文件标签（对比候选；对比标签本身持有重复路径不参与） */
+  const fileTabs = useMemo(
+    () => tabState.tabs.filter((t): t is TabInfo => 'path' in t),
+    [tabState.tabs],
+  );
+
+  const startCompare = useCallback(() => {
+    if (tabStateRef.current.tabs.filter(t => 'path' in t).length < 2) {
+      showToast('对比需要先打开两个文件');
+      return;
+    }
+    setCompareOpen(true);
+  }, [showToast]);
+
+  /** 创建对比标签（同一对文件任意顺序只开一个） */
+  const openCompare = useCallback(
+    (a: string, b: string) => {
+      setCompareOpen(false);
+      if (a === b) {
+        showToast('请选择两个不同的文件');
+        return;
+      }
+      const dup = tabStateRef.current.tabs.find(
+        t =>
+          !('path' in t) &&
+          t.kind === 'diff' &&
+          ((t.pathA === a && t.pathB === b) || (t.pathA === b && t.pathB === a)),
+      );
+      if (dup) {
+        setTabState(s => ({ ...s, activeId: dup.id }));
+        showToast('该对比已打开');
+        return;
+      }
+      const id = `diff-${Date.now().toString(36)}-${(idSeqRef.current++).toString(36)}`;
+      setTabState(s => ({ tabs: [...s.tabs, { id, kind: 'diff', pathA: a, pathB: b }], activeId: id }));
+    },
+    [showToast],
+  );
+
+  // ---------- 命令面板（Ctrl+Shift+P） ----------
+
+  const [paletteOpen, setPaletteOpen] = useState(false);
+
   // ---------- 标签页状态上报 ----------
 
   const handleStatusChange = useCallback((tabId: string, s: FileTabStatus) => {
@@ -266,7 +317,11 @@ function App() {
       const ctrl = e.ctrlKey || e.metaKey;
       const key = e.key.toLowerCase();
 
-      if (ctrl && key === 'f') {
+      if (ctrl && e.shiftKey && key === 'p') {
+        // Ctrl+Shift+P 命令面板（面板自身是 modal，打开期间本处理器自动让位）
+        e.preventDefault();
+        setPaletteOpen(true);
+      } else if (ctrl && key === 'f') {
         e.preventDefault();
         searchInputRef.current?.focus();
         searchInputRef.current?.select();
@@ -313,6 +368,25 @@ function App() {
         // Ctrl+E 按当前模式开始编辑
         e.preventDefault();
         getActiveHandle()?.startEdit();
+      } else if (ctrl && key === 'x' && !inInput) {
+        // Ctrl+X 剪切选中区间（复制 + 删除，可撤销）；无选中时提示
+        e.preventDefault();
+        getActiveHandle()?.cut();
+      } else if (e.key === 'Insert' && !inInput) {
+        // Insert 插入对话框；Ctrl+Shift+Insert 把剪贴板内容插入光标处
+        e.preventDefault();
+        if (ctrl && e.shiftKey) getActiveHandle()?.insertFromClipboard();
+        else if (!ctrl && !e.shiftKey && !e.altKey) getActiveHandle()?.insert();
+      } else if (
+        e.key === 'Delete' &&
+        !ctrl &&
+        !e.shiftKey &&
+        !e.altKey &&
+        !inInput
+      ) {
+        // Delete 删除选中区间 / 光标处单字节（可撤销）
+        e.preventDefault();
+        getActiveHandle()?.deleteSelection();
       } else if (e.key === 'Enter' && !inInput) {
         // Enter 开始编辑（行内编辑框是 input，inInput 已跳过）
         e.preventDefault();
@@ -333,25 +407,110 @@ function App() {
 
   // ---------- 派生展示数据 ----------
 
-  const activeTab =
-    tabState.tabs.find(t => t.id === tabState.activeId) ?? tabState.tabs[0] ?? null;
+  /** 激活的文件标签（对比标签不参与工具栏文件区） */
+  const activeTab = useMemo(() => {
+    const t = tabState.tabs.find(x => x.id === tabState.activeId) ?? tabState.tabs[0] ?? null;
+    return t && 'path' in t ? t : null;
+  }, [tabState]);
   const activeStatus = activeTab ? tabStatus.get(activeTab.id) ?? null : null;
 
   const tabItems = useMemo<TabBarItem[]>(
     () =>
       tabState.tabs.map(t => {
-        const st = tabStatus.get(t.id);
+        if ('path' in t) {
+          const st = tabStatus.get(t.id);
+          return {
+            id: t.id,
+            path: t.path,
+            name: st?.name ?? '',
+            dirty: (st?.editCount ?? 0) > 0,
+          };
+        }
+        // 对比标签：显示两个文件名（顺序与左右一致）
+        const nameOf = (p: string) => p.split(/[\\/]/).pop() ?? p;
         return {
           id: t.id,
-          path: t.path,
-          name: st?.name ?? '',
-          dirty: (st?.editCount ?? 0) > 0,
+          path: `${t.pathA} ↔ ${t.pathB}`,
+          name: `${nameOf(t.pathA)} ↔ ${nameOf(t.pathB)}`,
+          dirty: false,
+          kind: 'diff' as const,
         };
       }),
     [tabState.tabs, tabStatus],
   );
 
   const closeConfirmStatus = closeConfirmTabId ? tabStatus.get(closeConfirmTabId) : null;
+
+  // ---------- 命令面板装配（打开时从激活文件标签收集文件命令） ----------
+
+  const paletteCommands = useMemo<CommandDef[]>(() => {
+    if (!paletteOpen) return [];
+    const global: CommandDef[] = [
+      { id: 'app.open', label: '打开文件', category: '应用' },
+      { id: 'app.closeTab', label: '关闭当前标签页', category: '应用' },
+      { id: 'app.compare', label: '对比两个文件', category: '应用' },
+      { id: 'app.palette', label: '命令面板', category: '应用', shortcut: 'Ctrl+Shift+P' },
+      { id: 'app.themeDark', label: '主题：暗色', category: '外观' },
+      { id: 'app.themeLight', label: '主题：亮色', category: '外观' },
+      { id: 'app.themeContrast', label: '主题：高对比', category: '外观' },
+      {
+        id: 'app.toggleAscii',
+        label: config.showAscii ? '隐藏 ASCII 列' : '显示 ASCII 列',
+        category: '外观',
+      },
+      { id: 'app.search', label: '聚焦搜索框', category: '视图', shortcut: 'Ctrl+F' },
+      { id: 'app.goto', label: '聚焦跳转框', category: '视图', shortcut: 'Ctrl+G' },
+    ];
+    const state = tabStateRef.current;
+    const active = state.tabs.find(t => t.id === state.activeId);
+    const fileCmds =
+      active && 'path' in active ? tabHandles.current.get(active.id)?.listCommands() ?? [] : [];
+    return [...global, ...fileCmds];
+  }, [paletteOpen, config.showAscii]);
+
+  const runPaletteCommand = useCallback(
+    (id: string) => {
+      if (id.startsWith('app.')) {
+        switch (id) {
+          case 'app.open':
+            void handleOpenFile();
+            break;
+          case 'app.closeTab': {
+            const tabId = activeIdRef.current;
+            if (tabId) requestCloseTab(tabId);
+            break;
+          }
+          case 'app.compare':
+            startCompare();
+            break;
+          case 'app.themeDark':
+            setTheme('dark');
+            break;
+          case 'app.themeLight':
+            setTheme('light');
+            break;
+          case 'app.themeContrast':
+            setTheme('contrast');
+            break;
+          case 'app.toggleAscii':
+            toggleAscii();
+            break;
+          case 'app.search':
+            searchInputRef.current?.focus();
+            searchInputRef.current?.select();
+            break;
+          case 'app.goto':
+            gotoInputRef.current?.focus();
+            gotoInputRef.current?.select();
+            break;
+        }
+        return;
+      }
+      const tabId = activeIdRef.current;
+      if (tabId) tabHandles.current.get(tabId)?.runCommand(id);
+    },
+    [handleOpenFile, requestCloseTab, startCompare, setTheme, toggleAscii],
+  );
 
   return (
     <div className="app-container" data-theme={config.theme}>
@@ -366,6 +525,8 @@ function App() {
         onOpenFile={handleOpenFile}
         unsaved={(activeStatus?.editCount ?? 0) > 0}
         onCloseFile={() => activeTab && requestCloseTab(activeTab.id)}
+        onCompare={startCompare}
+        canCompare={fileTabs.length >= 2}
         recentFiles={recentFiles}
         onOpenRecent={p => void openNewTab(p)}
         onClearRecent={clearRecent}
@@ -427,31 +588,43 @@ function App() {
           </div>
         </div>
       ) : (
-        tabState.tabs.map(t => (
-          <FileTab
-            key={t.id}
-            ref={h => {
-              if (h) tabHandles.current.set(t.id, h);
-              else tabHandles.current.delete(t.id);
-            }}
-            tabId={t.id}
-            path={t.path}
-            active={t.id === tabState.activeId}
-            config={config}
-            onZoom={zoomFont}
-            onEditModeChange={setEditMode}
-            onConfirmSaveChange={setConfirmSave}
-            onVersionModeChange={setVersionMode}
-            aiConfig={ai.config}
-            onAiConfigChange={ai.updateConfig}
-            onAiResetSystemPrompt={ai.resetSystemPrompt}
-            toast={t.id === tabState.activeId ? toast : null}
-            showToast={showToast}
-            onStatusChange={handleStatusChange}
-            onOpenFailed={handleOpenFailed}
-            onGotoFill={handleGotoFill}
-          />
-        ))
+        tabState.tabs.map(t =>
+          'path' in t ? (
+            <FileTab
+              key={t.id}
+              ref={h => {
+                if (h) tabHandles.current.set(t.id, h);
+                else tabHandles.current.delete(t.id);
+              }}
+              tabId={t.id}
+              path={t.path}
+              active={t.id === tabState.activeId}
+              config={config}
+              onZoom={zoomFont}
+              onEditModeChange={setEditMode}
+              onConfirmSaveChange={setConfirmSave}
+              onVersionModeChange={setVersionMode}
+              aiConfig={ai.config}
+              onAiConfigChange={ai.updateConfig}
+              onAiResetSystemPrompt={ai.resetSystemPrompt}
+              toast={t.id === tabState.activeId ? toast : null}
+              showToast={showToast}
+              onStatusChange={handleStatusChange}
+              onOpenFailed={handleOpenFailed}
+              onGotoFill={handleGotoFill}
+            />
+          ) : (
+            <DiffTab
+              key={t.id}
+              tabId={t.id}
+              pathA={t.pathA}
+              pathB={t.pathB}
+              active={t.id === tabState.activeId}
+              config={config}
+              showToast={showToast}
+            />
+          ),
+        )
       )}
 
       {/* 关闭标签页：有未保存修改时三选一 */}
@@ -495,7 +668,79 @@ function App() {
           onCancel={() => setCloseConfirmTabId(null)}
         />
       )}
+
+      {/* 对比模式：从已打开文件中选择两个 */}
+      {compareOpen && fileTabs.length >= 2 && (
+        <CompareDialog tabs={fileTabs} onConfirm={openCompare} onCancel={() => setCompareOpen(false)} />
+      )}
+
+      {/* 快捷命令面板（Ctrl+Shift+P） */}
+      {paletteOpen && (
+        <CommandPalette
+          commands={paletteCommands}
+          onRun={runPaletteCommand}
+          onClose={() => setPaletteOpen(false)}
+        />
+      )}
     </div>
+  );
+}
+
+/** 对比模式文件选择：左右两个下拉（同一文件不可选） */
+function CompareDialog({
+  tabs,
+  onConfirm,
+  onCancel,
+}: {
+  tabs: TabInfo[];
+  onConfirm: (a: string, b: string) => void;
+  onCancel: () => void;
+}) {
+  const [a, setA] = useState(tabs[0]?.path ?? '');
+  const [b, setB] = useState(tabs[1]?.path ?? '');
+  return createPortal(
+    <div className="modal-mask">
+      <div className="modal edit-dialog" role="dialog" aria-label="对比两个文件">
+        <div className="modal-title">对比两个文件</div>
+        <div className="modal-body">
+          <div className="edit-row">
+            <span className="edit-label">左侧文件</span>
+            <select className="edit-input mono" value={a} onChange={e => setA(e.target.value)}>
+              {tabs.map(t => (
+                <option key={t.path} value={t.path}>
+                  {t.path}
+                </option>
+              ))}
+            </select>
+          </div>
+          <div className="edit-row">
+            <span className="edit-label">右侧文件</span>
+            <select className="edit-input mono" value={b} onChange={e => setB(e.target.value)}>
+              {tabs.map(t => (
+                <option key={t.path} value={t.path}>
+                  {t.path}
+                </option>
+              ))}
+            </select>
+          </div>
+          {a === b && <p className="side-error">请选择两个不同的文件</p>}
+          <p className="edit-hint">对比标签页为只读：按行同步滚动，高亮差异区间，可逐处跳转</p>
+        </div>
+        <div className="modal-actions">
+          <button
+            className="btn primary"
+            disabled={!a || !b || a === b}
+            onClick={() => onConfirm(a, b)}
+          >
+            开始对比
+          </button>
+          <button className="btn plain" onClick={onCancel}>
+            取消
+          </button>
+        </div>
+      </div>
+    </div>,
+    document.body,
   );
 }
 

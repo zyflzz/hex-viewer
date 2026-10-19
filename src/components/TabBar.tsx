@@ -7,6 +7,8 @@ export interface TabBarItem {
   name: string;
   /** 有未保存修改 */
   dirty: boolean;
+  /** 对比标签页（只读，双文件并排）：显示区分图标与配色 */
+  kind?: 'diff';
 }
 
 interface TabBarProps {
@@ -31,7 +33,7 @@ export function TabBar({ tabs, activeId, onSelect, onClose, onNew }: TabBarProps
           key={t.id}
           role="tab"
           aria-selected={t.id === activeId}
-          className={`tab-item${t.id === activeId ? ' on' : ''}`}
+          className={`tab-item${t.id === activeId ? ' on' : ''}${t.kind === 'diff' ? ' tab-item-diff' : ''}`}
           title={t.path}
           onClick={() => onSelect(t.id)}
           // 中键关闭标签页
@@ -42,6 +44,7 @@ export function TabBar({ tabs, activeId, onSelect, onClose, onNew }: TabBarProps
             }
           }}
         >
+          {t.kind === 'diff' && <span className="tab-diff-icon" aria-hidden>⇄</span>}
           {t.dirty && <span className="tab-dirty" title="有未保存的修改" />}
           <span className="tab-name">{t.name || pathTail(t.path)}</span>
           <button

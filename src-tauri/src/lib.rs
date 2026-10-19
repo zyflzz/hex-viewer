@@ -6,7 +6,6 @@
 // - 进程内存 / CPU 性能数据
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,7 +17,11 @@ use sha2::{Digest, Sha256};
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use tauri::{Emitter, State};
 
+mod autosave;
+mod edit;
 mod versions;
+
+use edit::PieceTable;
 
 /// 单次 read_chunk 返回的最大字节数
 const MAX_CHUNK_LEN: u64 = 8 * 1024 * 1024;
@@ -61,11 +64,6 @@ pub struct FileMeta {
 }
 
 impl OpenedFile {
-    /// 供版本存储模块校验：当前打开的文件是否为指定路径
-    pub(crate) fn matches_path(&self, p: &str) -> bool {
-        self.path == p
-    }
-
     /// 当前文件路径（版本目录名按路径散列）
     pub(crate) fn path_string(&self) -> &str {
         &self.path
@@ -92,10 +90,12 @@ impl From<&OpenedFile> for FileMeta {
     }
 }
 
-/// 单个标签页的后端状态：文件句柄 + 三类后台扫描的代数（用于取消/作废）
+/// 单个标签页的后端状态：文件句柄 + piece 表 + 三类后台扫描的代数（用于取消/作废）
 #[derive(Clone)]
 pub struct TabState {
     pub(crate) file: Arc<OpenedFile>,
+    /// 可变长度编辑状态（打开/保存后为"干净的"单基线 piece）
+    pub(crate) edits: Arc<Mutex<PieceTable>>,
     pub(crate) search_gen: Arc<AtomicU64>,
     pub(crate) analysis_gen: Arc<AtomicU64>,
     pub(crate) strings_gen: Arc<AtomicU64>,
@@ -103,12 +103,20 @@ pub struct TabState {
 
 impl TabState {
     fn new(file: Arc<OpenedFile>) -> Self {
+        let edits = Arc::new(Mutex::new(PieceTable::new(file.size)));
         TabState {
             file,
+            edits,
             search_gen: Arc::new(AtomicU64::new(0)),
             analysis_gen: Arc::new(AtomicU64::new(0)),
             strings_gen: Arc::new(AtomicU64::new(0)),
         }
+    }
+
+    /// 保存成功后重建：保留扫描代数，piece 表重置为干净基线
+    fn rebuild(file: Arc<OpenedFile>, search_gen: Arc<AtomicU64>, analysis_gen: Arc<AtomicU64>, strings_gen: Arc<AtomicU64>) -> Self {
+        let edits = Arc::new(Mutex::new(PieceTable::new(file.size)));
+        TabState { file, edits, search_gen, analysis_gen, strings_gen }
     }
 }
 
@@ -132,16 +140,6 @@ impl AppState {
     /// 取标签页状态（不存在 = 尚未打开）
     pub(crate) fn get_tab(&self, tab_id: &str) -> Option<TabState> {
         self.tabs.lock().unwrap().get(tab_id).cloned()
-    }
-
-    /// 按路径在所有标签页中查找文件（同一文件不允许打开两个标签页，路径唯一）
-    pub(crate) fn find_by_path(&self, path: &str) -> Option<Arc<OpenedFile>> {
-        self.tabs
-            .lock()
-            .unwrap()
-            .values()
-            .find(|t| t.file.matches_path(path))
-            .map(|t| t.file.clone())
     }
 
     pub(crate) fn insert_tab(&self, tab_id: String, st: TabState) {
@@ -328,7 +326,69 @@ fn close_tab(tab_id: String, state: State<AppState>) {
     state.remove_tab(&tab_id);
 }
 
-/// 按需读取字节切片（返回原始二进制，避免 JSON 序列化开销）
+/// 读取任意路径的文件元信息（插入对话框"从文件插入"预检，不占用标签页句柄）
+#[tauri::command]
+fn get_file_meta(path: String) -> Result<FileMeta, String> {
+    let md = fs::metadata(&path).map_err(|e| format!("无法读取文件信息: {}", e))?;
+    if !md.is_file() {
+        return Err("不是常规文件".into());
+    }
+    let name = Path::new(&path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let extension = Path::new(&path)
+        .extension()
+        .map(|s| s.to_string_lossy().to_lowercase())
+        .unwrap_or_default();
+    Ok(FileMeta {
+        path,
+        name,
+        size: md.len(),
+        modified: unix_secs(md.modified()),
+        created: unix_secs(md.created()),
+        extension,
+        kind: String::new(),
+        is_readonly: md.permissions().readonly(),
+    })
+}
+
+/// 读取任意路径的文件内容（插入对话框"从文件插入"；超 max_len 拒绝，防误读超大文件）
+#[tauri::command]
+fn read_file_bytes(path: String, max_len: u64) -> Result<Vec<u8>, String> {
+    let md = fs::metadata(&path).map_err(|e| format!("无法读取文件信息: {}", e))?;
+    if !md.is_file() {
+        return Err("不是常规文件".into());
+    }
+    if md.len() > max_len {
+        return Err(format!("文件过大（{} 字节），上限 {} 字节", md.len(), max_len));
+    }
+    fs::read(&path).map_err(|e| format!("读取文件失败: {}", e))
+}
+
+/// 查找某字节值在磁盘内容中首次出现的位置（分析选项卡直方图点击跳转）
+#[tauri::command]
+async fn find_first_byte(
+    tab_id: String,
+    value: u8,
+    state: State<'_, AppState>,
+) -> Result<Option<u64>, String> {
+    let tab = state.get_tab(&tab_id).ok_or("尚未打开文件")?;
+    let file = tab.file;
+    let handle = tauri::async_runtime::spawn_blocking(move || {
+        Ok(file
+            .mmap
+            .as_ref()
+            .and_then(|m| m.iter().position(|&b| b == value).map(|p| p as u64)))
+    });
+    match handle.await {
+        Ok(r) => r,
+        Err(e) => Err(format!("查找任务失败: {}", e)),
+    }
+}
+
+/// 按需读取字节切片（返回原始二进制，避免 JSON 序列化开销）。
+/// v1.1.4 起 offset 为虚拟偏移：跨 piece 拼接（基线 + 插入内容 - 删除区间）。
 #[tauri::command]
 fn read_chunk(
     tab_id: String,
@@ -338,22 +398,64 @@ fn read_chunk(
 ) -> Result<tauri::ipc::Response, String> {
     let tab = state.get_tab(&tab_id).ok_or("尚未打开文件")?;
     let file = tab.file;
-    if file.size == 0 || offset >= file.size {
+    let base: &[u8] = file.mmap.as_ref().map(|m| &m[..]).unwrap_or(&[]);
+    let pt = tab.edits.lock().unwrap();
+    let vsize = pt.virtual_size();
+    if vsize == 0 || offset >= vsize {
         return Ok(tauri::ipc::Response::new(Vec::new()));
     }
-    let len = length.min(file.size - offset).min(MAX_CHUNK_LEN) as usize;
-    let start = offset as usize;
-    let bytes = if let Some(m) = &file.mmap {
-        let end = (start + len).min(m.len());
-        if start < end {
-            m[start..end].to_vec()
-        } else {
-            Vec::new()
-        }
-    } else {
-        Vec::new()
-    };
+    let len = length.min(vsize - offset).min(MAX_CHUNK_LEN);
+    let bytes = pt.read(offset, len, base);
     Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// 在虚拟偏移处插入字节（可变长度编辑）。返回新的虚拟大小。
+#[tauri::command]
+fn insert_bytes(
+    tab_id: String,
+    offset: u64,
+    bytes: Vec<u8>,
+    state: State<AppState>,
+) -> Result<u64, String> {
+    if bytes.is_empty() {
+        return Err("插入内容为空".into());
+    }
+    let tab = state.get_tab(&tab_id).ok_or("尚未打开文件")?;
+    let mut pt = tab.edits.lock().unwrap();
+    if offset > pt.virtual_size() {
+        return Err(format!("插入位置超出文件末尾（当前共 {} 字节）", pt.virtual_size()));
+    }
+    pt.insert(offset, &bytes);
+    Ok(pt.virtual_size())
+}
+
+/// 删除虚拟区间 [offset, offset+len)。返回新的虚拟大小。
+#[tauri::command]
+fn delete_range(
+    tab_id: String,
+    offset: u64,
+    len: u64,
+    state: State<AppState>,
+) -> Result<u64, String> {
+    if len == 0 {
+        return Err("删除长度不能为 0".into());
+    }
+    let tab = state.get_tab(&tab_id).ok_or("尚未打开文件")?;
+    let mut pt = tab.edits.lock().unwrap();
+    let vsize = pt.virtual_size();
+    if offset >= vsize || offset + len > vsize {
+        return Err(format!("删除区间超出文件末尾（当前共 {} 字节）", vsize));
+    }
+    pt.delete(offset, len);
+    Ok(pt.virtual_size())
+}
+
+/// 当前虚拟大小（= 基线 + 插入 - 删除）
+#[tauri::command]
+fn get_virtual_size(tab_id: String, state: State<AppState>) -> Result<u64, String> {
+    let tab = state.get_tab(&tab_id).ok_or("尚未打开文件")?;
+    let vsize = tab.edits.lock().unwrap().virtual_size();
+    Ok(vsize)
 }
 
 /// 前端覆盖层的单条字节修改
@@ -364,8 +466,8 @@ pub struct ByteChange {
 }
 
 /// 保存的核心流程（阻塞线程内执行）：
-/// 1. 合并同一偏移的多次修改（BTreeMap 自动按偏移有序）
-/// 2. 原文件内容 + 修改 → 写同目录临时文件（sync 落盘）
+/// 1. 合并同一偏移的多次修改（BTreeMap 自动按偏移有序），偏移按虚拟大小校验
+/// 2. 按 piece 表顺序输出（基线 + 追加缓冲），同时应用覆盖层补丁 → 写同目录临时文件（sync 落盘）
 /// 3. rename 原子替换目标文件
 ///
 /// 写回原文件时必须先解除 mmap（Windows 上被映射的文件无法被 rename 覆盖），
@@ -373,6 +475,7 @@ pub struct ByteChange {
 /// 返回 (新元数据, 应放回 state 的文件句柄)；失败时句柄为原文件或重开的原文件。
 fn save_file_blocking(
     opened: Arc<OpenedFile>,
+    edits: Arc<Mutex<PieceTable>>,
     changes: Vec<ByteChange>,
     path: Option<String>,
 ) -> Result<(FileMeta, Arc<OpenedFile>), (String, Option<Arc<OpenedFile>>)> {
@@ -382,11 +485,18 @@ fn save_file_blocking(
         return Err(("文件为只读，请改用另存为".into(), Some(opened)));
     }
 
+    // 取出 piece 表快照（pieces + 追加缓冲），锁只在这里短暂持有
+    let (pieces, append_buf) = {
+        let pt = edits.lock().unwrap();
+        (pt.pieces().to_vec(), pt.append_buf().to_vec())
+    };
+    let virtual_size: u64 = pieces.iter().map(|p| p.len).sum();
+
     let mut merged = std::collections::BTreeMap::new();
     for c in changes {
-        if c.offset >= opened.size {
+        if c.offset >= virtual_size {
             return Err((
-                format!("偏移 {} 超出文件末尾（文件共 {} 字节）", c.offset, opened.size),
+                format!("偏移 {} 超出文件末尾（当前共 {} 字节）", c.offset, virtual_size),
                 Some(opened),
             ));
         }
@@ -404,19 +514,11 @@ fn save_file_blocking(
         .unwrap_or(0);
     let tmp = dir.join(format!(".hexsave-{}-{}", std::process::id(), nanos));
 
+    // 用临时 piece 表按顺序写出（from_append 的 piece 指向本地追加缓冲副本）
+    let snap = PieceTable::from_parts(pieces, append_buf);
     let write = (|| -> std::io::Result<()> {
         let mut out = fs::File::create(&tmp)?;
-        let mut pos: u64 = 0;
-        for (off, val) in &merged {
-            if *off > pos {
-                out.write_all(&src[pos as usize..*off as usize])?;
-            }
-            out.write_all(&[*val])?;
-            pos = off + 1;
-        }
-        if (pos as usize) < src.len() {
-            out.write_all(&src[pos as usize..])?;
-        }
+        snap.write_patched(&mut out, src, &merged)?;
         out.sync_all()?;
         Ok(())
     })();
@@ -456,10 +558,10 @@ fn save_file_blocking(
     }
 }
 
-/// 保存覆盖层修改：path 为 None 写回当前文件，Some 为另存为。
-/// 异步命令 + spawn_blocking，大文件复制不阻塞 IPC。
+/// 保存（覆盖层 + piece 表）到磁盘：path 为 None 写回当前文件，Some 为另存为。
+/// 异步命令 + spawn_blocking，大文件写出不阻塞 IPC。
 /// 保存期间该标签页的映射临时移除（Windows 上被映射的文件无法被 rename 覆盖），
-/// 完成后（含失败恢复）放回映射。
+/// 完成后（含失败恢复）放回映射；写回成功后 piece 表重置为干净基线。
 #[tauri::command]
 async fn save_file(
     tab_id: String,
@@ -470,36 +572,43 @@ async fn save_file(
     let tab = state.remove_tab(&tab_id).ok_or("尚未打开文件")?;
     let orig_path = tab.file.path.clone();
     let opened = tab.file;
+    let edits = tab.edits;
     let search_gen = tab.search_gen;
     let analysis_gen = tab.analysis_gen;
     let strings_gen = tab.strings_gen;
-    let rebuild = |file: Arc<OpenedFile>| TabState {
-        file,
-        search_gen,
-        analysis_gen,
-        strings_gen,
+    // 就地保存成功：磁盘已是新内容，piece 表重置为干净基线；
+    // 其余情况（另存为 / 任何失败）：磁盘上的当前文件未变，保留原 piece 表（未保存编辑不丢）
+    let in_place = path.is_none();
+    let edits_for_save = edits.clone();
+    let rebuild = move |file: Arc<OpenedFile>, reset_edits: bool| {
+        if reset_edits {
+            TabState::rebuild(file, search_gen, analysis_gen, strings_gen)
+        } else {
+            TabState { file, edits, search_gen, analysis_gen, strings_gen }
+        }
     };
-    let handle =
-        tauri::async_runtime::spawn_blocking(move || save_file_blocking(opened, changes, path));
+    let handle = tauri::async_runtime::spawn_blocking(move || {
+        save_file_blocking(opened, edits_for_save, changes, path)
+    });
     match handle.await {
         Ok(Ok((meta, file))) => {
-            state.insert_tab(tab_id, rebuild(file));
+            state.insert_tab(tab_id, rebuild(file, in_place));
             Ok(meta)
         }
         Ok(Err((msg, Some(file)))) => {
-            state.insert_tab(tab_id, rebuild(file));
+            state.insert_tab(tab_id, rebuild(file, false));
             Err(msg)
         }
         Ok(Err((msg, None))) => {
-            // 句柄已丢失（如 panic 或重开失败），尽力恢复
+            // 句柄已丢失（如 panic 或重开失败），尽力恢复（原 piece 表仍对应当前磁盘内容）
             if let Ok(f) = open_mapped(&orig_path) {
-                state.insert_tab(tab_id, rebuild(f));
+                state.insert_tab(tab_id, rebuild(f, false));
             }
             Err(msg)
         }
         Err(e) => {
             if let Ok(f) = open_mapped(&orig_path) {
-                state.insert_tab(tab_id, rebuild(f));
+                state.insert_tab(tab_id, rebuild(f, false));
             }
             Err(format!("保存任务失败: {}", e))
         }
@@ -730,6 +839,8 @@ pub struct FileStats {
     pub zero: u64,
     /// 换行符数量
     pub line_breaks: u64,
+    /// 逐字节值分布（0x00..=0xFF 的出现次数，与统计扫描一次遍历同时得到）
+    pub histogram: Vec<u64>,
 }
 
 fn scan_stats(
@@ -747,7 +858,9 @@ fn scan_stats(
         high: 0,
         zero: 0,
         line_breaks: 0,
+        histogram: vec![0u64; 256],
     };
+    let hist = stats.histogram.as_mut_slice();
     let mut i = 0usize;
     while i < n {
         if gen.load(Ordering::Relaxed) != my_gen {
@@ -755,6 +868,7 @@ fn scan_stats(
         }
         let block_end = (i + SCAN_BLOCK).min(n);
         for &b in &data[i..block_end] {
+            hist[b as usize] += 1;
             match b {
                 0 => stats.zero += 1,
                 10 => stats.line_breaks += 1,
@@ -1172,11 +1286,144 @@ fn get_perf(state: State<AppState>) -> PerfInfo {
             memory: p.memory(),
             cpu: p.cpu_usage(),
         },
-        None => PerfInfo {
-            memory: 0,
-            cpu: 0.0,
-        },
+        None => PerfInfo { memory: 0, cpu: 0.0 },
     }
+}
+
+// ============ 对比模式（v1.1.4） ============
+
+/// 差异区间：两边文件在 [start, start+len) 内不同（或该区间只存在于较长的一侧）
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiffRange {
+    pub start: u64,
+    pub len: u64,
+}
+
+/// 相邻差异合并的最大间隙（字节）：间隙内的相同字节并入区间，减少区间数量
+const DIFF_MERGE_GAP: u64 = 16;
+/// 差异区间数量上限（超出截断，前端提示）
+const MAX_DIFF_RANGES: usize = 100_000;
+
+/// 逐字节比较两个已打开标签页的磁盘内容，返回差异区间列表。
+/// 只比较两边都存在的位置；多出的尾部作为一个整体区间返回。
+#[tauri::command]
+async fn diff_files(
+    state: State<'_, AppState>,
+    tab_id_a: String,
+    tab_id_b: String,
+) -> Result<Vec<DiffRange>, String> {
+    let tab_a = state.get_tab(&tab_id_a).ok_or("文件 A 尚未打开")?;
+    let tab_b = state.get_tab(&tab_id_b).ok_or("文件 B 尚未打开")?;
+    let a = tab_a.file;
+    let b = tab_b.file;
+    let handle = tauri::async_runtime::spawn_blocking(move || {
+        let da: &[u8] = a.mmap.as_ref().map(|m| &m[..]).unwrap_or(&[]);
+        let db: &[u8] = b.mmap.as_ref().map(|m| &m[..]).unwrap_or(&[]);
+        let common = da.len().min(db.len());
+        let mut ranges: Vec<DiffRange> = Vec::new();
+        let mut cur_start: Option<u64> = None;
+        let mut cur_end: u64 = 0;
+        let block = 4 * 1024 * 1024;
+        let mut pos = 0usize;
+        while pos < common {
+            let take = block.min(common - pos);
+            let a_slice = &da[pos..pos + take];
+            let b_slice = &db[pos..pos + take];
+            if a_slice == b_slice {
+                // 整块相同：与当前区段的间隙超过阈值则收尾
+                if let Some(s) = cur_start {
+                    if pos as u64 - cur_end > DIFF_MERGE_GAP {
+                        ranges.push(DiffRange { start: s, len: (cur_end - s).max(1) });
+                        cur_start = None;
+                    }
+                }
+            } else {
+                for i in 0..take {
+                    if a_slice[i] != b_slice[i] {
+                        let off = (pos + i) as u64;
+                        match cur_start {
+                            Some(s) if off - cur_end <= DIFF_MERGE_GAP => {
+                                let _ = s;
+                                cur_end = off + 1;
+                            }
+                            Some(s) => {
+                                ranges.push(DiffRange { start: s, len: (cur_end - s).max(1) });
+                                cur_start = Some(off);
+                                cur_end = off + 1;
+                            }
+                            None => {
+                                cur_start = Some(off);
+                                cur_end = off + 1;
+                            }
+                        }
+                        if ranges.len() >= MAX_DIFF_RANGES {
+                            break;
+                        }
+                    }
+                }
+                if ranges.len() >= MAX_DIFF_RANGES {
+                    break;
+                }
+            }
+            pos += take;
+        }
+        if let Some(s) = cur_start {
+            ranges.push(DiffRange { start: s, len: (cur_end - s).max(1) });
+        }
+        // 长度差异：多出的尾部整体作为一个区间
+        let (la, lb) = (da.len() as u64, db.len() as u64);
+        if la != lb {
+            ranges.push(DiffRange { start: la.min(lb), len: la.max(lb) - la.min(lb) });
+        }
+        ranges
+    });
+    handle.await.map_err(|e| format!("差异计算任务失败: {}", e))
+}
+
+// ============ 熵图（v1.1.4） ============
+
+/// 计算磁盘内容按块大小的香农熵（0..=8 bit/byte）。
+/// 实际块大小 = max(用户选择, 文件大小/4000)，防止超大文件产生过多分块。
+#[tauri::command]
+async fn compute_entropy(
+    state: State<'_, AppState>,
+    tab_id: String,
+    block_size: u64,
+) -> Result<Vec<f32>, String> {
+    let tab = state.get_tab(&tab_id).ok_or("尚未打开文件")?;
+    let file = tab.file;
+    let handle = tauri::async_runtime::spawn_blocking(move || {
+        let data: &[u8] = file.mmap.as_ref().map(|m| &m[..]).unwrap_or(&[]);
+        let n = data.len() as u64;
+        if n == 0 {
+            return Vec::new();
+        }
+        let target_blocks = 4000u64;
+        let min_block = n.div_ceil(target_blocks);
+        let block = block_size.max(min_block).max(1);
+        let mut out = Vec::with_capacity((n / block + 1) as usize);
+        let mut pos = 0usize;
+        while pos < data.len() {
+            let end = (pos + block as usize).min(data.len());
+            let mut bins = [0u64; 256];
+            for &b in &data[pos..end] {
+                bins[b as usize] += 1;
+            }
+            let total = (end - pos) as f64;
+            let mut h = 0f64;
+            for &c in bins.iter() {
+                if c > 0 {
+                    let p = c as f64 / total;
+                    h -= p * p.log2();
+                }
+            }
+            out.push(h as f32);
+            pos = end;
+        }
+        out
+    });
+    handle.await.map_err(|e| format!("熵计算任务失败: {}", e))
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1188,13 +1435,21 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             open_file,
             close_tab,
+            get_file_meta,
+            read_file_bytes,
+            find_first_byte,
             read_chunk,
+            insert_bytes,
+            delete_range,
+            get_virtual_size,
             save_file,
             search,
             cancel_search,
             analyze_file,
             extract_strings,
             compute_checksums,
+            diff_files,
+            compute_entropy,
             get_perf,
             versions::list_versions,
             versions::save_version,
@@ -1202,7 +1457,10 @@ pub fn run() {
             versions::delete_version,
             versions::rename_version,
             versions::cleanup_versions,
-            versions::versions_global_size
+            versions::versions_global_size,
+            autosave::save_autosave,
+            autosave::load_autosave,
+            autosave::clear_autosave
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

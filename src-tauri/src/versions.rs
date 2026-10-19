@@ -1,16 +1,19 @@
-// 历史版本存储（v1.0.2.003）：
+// 历史版本存储（v1.1.4，格式 v2）：
 // 每个文件一个目录 <app_data>/hex-viewer/versions/<sha256(path)[0..16]>/：
-// - base.bin         基线快照（首次记录版本时从当前 mmap 全量拷贝，所有版本共享）
-// - meta.json        版本索引（不含 ops / overlay），存储顺序 = 时间顺序（最新在末尾）
-// - v<id>.json.zst   单版本完整数据（ops 快照 + pos + overlay），zstd 压缩
+// - base.bin         基线快照（首次记录版本时从磁盘内容全量拷贝，所有版本共享）
+// - meta.json        版本索引（format: 2），存储顺序 = 时间顺序（最新在末尾）
+// - v<id>.json.zst   单版本完整数据（ops 快照 + pos + 内容差异），zstd 压缩
 //
-// overlay 语义：相对 base.bin 的完整差异，版本内容 = base + overlay。
-// 各版本互相独立（不引用其他版本），删除任一版本不影响其余版本的恢复。
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+// v2 差异语义（支持变长编辑）：版本内容 = base.bin + 差异，两种形态互斥：
+// - overlay（等长）：逐字节点差异 [offset, version_value]
+// - structural（变长）：公共前缀 + 中段替换（base 中段长度 + 版本中段字节）+ 隐式公共后缀
+// 记录时直接对比 base.bin 与当前显示内容（piece 表 + 前端覆盖层补丁）；
+// 恢复时对比版本内容与当前显示内容，等长返回点差异，变长返回 {offset, deleteLen, insertBytes}。
+// v1 旧格式（meta.json 无 format 字段）不再兼容：读取时清空旧版本数据（保留 base.bin）。
+use std::collections::BTreeMap;
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -18,16 +21,19 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Manager, State};
 
-use crate::{AppState, OpenedFile};
+use crate::{AppState, OpenedFile, TabState};
+use crate::edit::{Piece, PieceTable};
 
 /// 每个文件最多保留的版本数（超出删最旧）
 const MAX_VERSIONS_PER_FILE: usize = 50;
 /// 每个文件的版本数据（v 文件合计，不含 base.bin）大小上限
 const MAX_VERSION_DATA_BYTES: u64 = 200 * 1024 * 1024;
-/// 基线扫描缓冲区大小
-const SCAN_BUF: usize = 8 * 1024 * 1024;
+/// 对比扫描缓冲区大小
+const SCAN_BUF: usize = 4 * 1024 * 1024;
 /// 解压版本数据的容量上限（防御异常数据）
 const MAX_DECOMPRESS: usize = 512 * 1024 * 1024;
+/// 变长差异中段的大小上限（超出拒绝记录/恢复）
+const MAX_MID_BYTES: u64 = 128 * 1024 * 1024;
 
 /// 版本元数据（列表展示用，不含 ops / overlay）
 #[derive(Clone, Serialize, Deserialize)]
@@ -56,13 +62,26 @@ pub struct SaveVersionPayload {
     pub edits: Vec<(u64, u8)>,
 }
 
-/// 单个版本的完整数据（磁盘格式）
+/// 单个版本的完整数据（磁盘格式，v2）
 #[derive(Serialize, Deserialize)]
 struct VersionData {
     ops: Value,
     pos: u64,
-    /// 相对 base.bin 的覆盖层 [offset, value]
+    /// 等长差异：[offset, version_value]（相对 base.bin；与 structural 互斥）
     overlay: Vec<(u64, u8)>,
+    /// 变长差异：base.bin 的 [prefix, prefix+base_mid_len) 中段替换为 mid
+    structural: Option<StructuralSnap>,
+}
+
+/// 变长差异快照（与 overlay 互斥）
+#[derive(Serialize, Deserialize, Clone)]
+struct StructuralSnap {
+    /// 公共前缀长度
+    prefix: u64,
+    /// base.bin 中被替换的中段长度
+    base_mid_len: u64,
+    /// 版本内容的中段字节
+    mid: Vec<u8>,
 }
 
 /// 版本内容与当前显示内容的差异（恢复/预览共用）
@@ -70,10 +89,19 @@ struct VersionData {
 #[serde(rename_all = "camelCase")]
 pub struct VersionDiffChange {
     pub offset: u64,
-    /// 当前显示值（未保存覆盖层 ?? 磁盘值）
+    /// 当前显示值（覆盖层 ?? piece 表值）
     pub old_value: u8,
     /// 版本内容值
     pub new_value: u8,
+}
+
+/// 变长恢复指令：删除 [offset, offset+delete_len) 后原位插入 insert_bytes
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StructuralDiff {
+    pub offset: u64,
+    pub delete_len: u64,
+    pub insert_bytes: Vec<u8>,
 }
 
 #[derive(Serialize)]
@@ -82,12 +110,18 @@ pub struct VersionDiff {
     pub changes: Vec<VersionDiffChange>,
     /// 因超出当前文件大小而跳过的偏移数
     pub skipped: u64,
+    /// 变长差异（与 changes 互斥）：前端作为复合操作恢复
+    pub structural: Option<StructuralDiff>,
 }
 
+/// 版本索引（磁盘格式）。format != 2 的旧数据读取时被清理。
 #[derive(Serialize, Deserialize, Default)]
 struct MetaFile {
+    format: u32,
     versions: Vec<VersionMeta>,
 }
+
+const META_FORMAT: u32 = 2;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -133,11 +167,32 @@ fn version_file(dir: &Path, id: &str) -> PathBuf {
     dir.join(format!("v{}.json.zst", id))
 }
 
-/// 读取版本索引；缺失/损坏视为空（下一次写入会重建）
+/// 读取版本索引；缺失视为空。旧格式（无 format 字段）清空旧版本数据后返回空。
 fn read_meta(dir: &Path) -> Vec<VersionMeta> {
-    fs::read(dir.join("meta.json"))
+    let raw = match fs::read(dir.join("meta.json")) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    // 先看 format 字段：旧格式（v1）不再兼容
+    let legacy = serde_json::from_slice::<Value>(&raw)
         .ok()
-        .and_then(|b| serde_json::from_slice::<MetaFile>(&b).ok())
+        .map(|v| v.get("format").and_then(|f| f.as_u64()) != Some(META_FORMAT as u64))
+        .unwrap_or(true);
+    if legacy {
+        // 清掉旧版本数据文件（base.bin 内容仍有效，保留）
+        if let Ok(rd) = fs::read_dir(dir) {
+            for e in rd.flatten() {
+                let p = e.path();
+                if p.extension().map(|x| x == "zst").unwrap_or(false) {
+                    let _ = fs::remove_file(p);
+                }
+            }
+        }
+        let _ = write_meta(dir, &[]);
+        return Vec::new();
+    }
+    serde_json::from_slice::<MetaFile>(&raw)
+        .ok()
         .map(|m| m.versions)
         .unwrap_or_default()
 }
@@ -145,6 +200,7 @@ fn read_meta(dir: &Path) -> Vec<VersionMeta> {
 /// 原子写版本索引（临时文件 + rename，避免崩溃留下半成品）
 fn write_meta(dir: &Path, metas: &[VersionMeta]) -> Result<(), String> {
     let json = serde_json::to_vec(&MetaFile {
+        format: META_FORMAT,
         versions: metas.to_vec(),
     })
     .map_err(|e| format!("序列化版本索引失败: {}", e))?;
@@ -185,133 +241,289 @@ fn enforce_limits(dir: &Path, metas: &mut Vec<VersionMeta>) {
     }
 }
 
-/// 基线扫描结果
-struct BaseScan {
-    /// base 与 mmap 不同的位置：(offset, base 字节, mmap 字节)
-    diffs: Vec<(u64, u8, u8)>,
-    /// 需要关注的位置（wanted ∪ diffs）的 base 字节
-    base_at: HashMap<u64, u8>,
-    base_len: u64,
+// ============ 内容源（对比的两侧） ============
+
+/// 随机可读的内容源
+trait ContentSource {
+    fn len(&self) -> u64;
+    /// 读取 [pos, pos+out.len())，返回实际读取字节数
+    fn read_at(&self, pos: u64, out: &mut [u8]) -> usize;
 }
 
-/// 流式扫描 base.bin 与当前 mmap 的差异（内存占用恒定：SCAN_BUF）。
-/// 同时捕获 wanted 集合中各偏移的 base 字节（含超出 mmap 长度的部分）。
-fn scan_base(base_path: &Path, mmap: &[u8], wanted: &HashSet<u64>) -> Result<BaseScan, String> {
-    let mut f =
-        fs::File::open(base_path).map_err(|e| format!("无法读取基线快照: {}", e))?;
-    let mut buf = vec![0u8; SCAN_BUF];
-    let mut scan = BaseScan {
-        diffs: Vec::new(),
-        base_at: HashMap::new(),
-        base_len: 0,
-    };
-    let mut pos: u64 = 0;
-    loop {
-        let n = f
-            .read(&mut buf)
-            .map_err(|e| format!("读取基线快照失败: {}", e))?;
-        if n == 0 {
+/// base.bin 文件源（seek + read）
+struct FileSource {
+    file: fs::File,
+    len: u64,
+}
+
+impl FileSource {
+    fn open(path: &Path) -> Result<Self, String> {
+        let file = fs::File::open(path).map_err(|e| format!("无法读取基线快照: {}", e))?;
+        let len = file.metadata().map_err(|e| format!("无法读取基线快照信息: {}", e))?.len();
+        Ok(FileSource { file, len })
+    }
+}
+
+impl ContentSource for FileSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+    fn read_at(&self, pos: u64, out: &mut [u8]) -> usize {
+        if pos >= self.len || out.is_empty() {
+            return 0;
+        }
+        let mut f = &self.file;
+        if f.seek(SeekFrom::Start(pos)).is_err() {
+            return 0;
+        }
+        let want = out.len().min((self.len - pos) as usize);
+        let mut got = 0usize;
+        while got < want {
+            match f.read(&mut out[got..want]) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(_) => break,
+            }
+        }
+        got
+    }
+}
+
+/// 版本内容源：base.bin + overlay 补丁 或 structural 中段拼接
+struct VersionSource {
+    base: FileSource,
+    /// 等长差异补丁（structural 为 None 时使用）
+    overlay: BTreeMap<u64, u8>,
+    /// 变长差异（存在时 overlay 为空）
+    structural: Option<StructuralSnap>,
+}
+
+impl ContentSource for VersionSource {
+    fn len(&self) -> u64 {
+        match &self.structural {
+            None => self.base.len(),
+            Some(s) => self.base.len() - s.base_mid_len + s.mid.len() as u64,
+        }
+    }
+    fn read_at(&self, pos: u64, out: &mut [u8]) -> usize {
+        match &self.structural {
+            None => {
+                let n = self.base.read_at(pos, out);
+                let end = pos + n as u64;
+                for (&o, &v) in self.overlay.range(pos..end) {
+                    out[(o - pos) as usize] = v;
+                }
+                n
+            }
+            Some(s) => {
+                let mid_len = s.mid.len() as u64;
+                let vlen = self.len();
+                if pos >= vlen {
+                    return 0;
+                }
+                let want = (out.len() as u64).min(vlen - pos);
+                let mut done = 0usize;
+                while done < want as usize {
+                    let cur = pos + done as u64;
+                    if cur < s.prefix {
+                        // 基线前缀段
+                        let take = ((s.prefix - cur).min(want - done as u64)) as usize;
+                        let mut got = 0usize;
+                        while got < take {
+                            let n = self.base.read_at(cur + got as u64, &mut out[done + got..done + take]);
+                            if n == 0 { break; }
+                            got += n;
+                        }
+                        done += got;
+                        if got < take { break; }
+                    } else if cur < s.prefix + mid_len {
+                        // 版本中段（内存字节）
+                        let start = (cur - s.prefix) as usize;
+                        let take = ((mid_len - (cur - s.prefix)).min(want - done as u64)) as usize;
+                        let end = (start + take).min(s.mid.len());
+                        out[done..done + (end - start)].copy_from_slice(&s.mid[start..end]);
+                        done += end - start;
+                    } else {
+                        // 基线后缀段：映射回基线偏移
+                        let base_pos = cur - mid_len + s.base_mid_len;
+                        let take = ((self.base.len() - base_pos).min(want - done as u64)) as usize;
+                        let mut got = 0usize;
+                        while got < take {
+                            let n = self.base.read_at(base_pos + got as u64, &mut out[done + got..done + take]);
+                            if n == 0 { break; }
+                            got += n;
+                        }
+                        done += got;
+                        if got < take { break; }
+                    }
+                }
+                done
+            }
+        }
+    }
+}
+
+/// 当前显示内容源：mmap 基线 + piece 表 + 前端覆盖层补丁
+struct DisplaySource<'a> {
+    mmap: &'a [u8],
+    pt: PieceTable,
+    patch: BTreeMap<u64, u8>,
+}
+
+impl ContentSource for DisplaySource<'_> {
+    fn len(&self) -> u64 {
+        self.pt.virtual_size()
+    }
+    fn read_at(&self, pos: u64, out: &mut [u8]) -> usize {
+        let data = self.pt.read(pos, out.len() as u64, self.mmap);
+        let n = data.len();
+        out[..n].copy_from_slice(&data);
+        let end = pos + n as u64;
+        for (&o, &v) in self.patch.range(pos..end) {
+            out[(o - pos) as usize] = v;
+        }
+        n
+    }
+}
+
+/// 两个内容源的差异
+enum ContentDiff {
+    /// 等长：点差异 (offset, from, to)
+    Replaces(Vec<(u64, u8, u8)>),
+    /// 变长：公共前缀 + from 中段长度 + to 中段内容（后缀隐式对齐）
+    Structural { prefix: u64, from_mid_len: u64, to_mid: Vec<u8> },
+}
+
+fn diff_sources(a: &dyn ContentSource, b: &dyn ContentSource) -> Result<ContentDiff, String> {
+    let (la, lb) = (a.len(), b.len());
+    let mut va = vec![0u8; SCAN_BUF];
+    let mut vb = vec![0u8; SCAN_BUF];
+    if la == lb {
+        let mut diffs = Vec::new();
+        let mut pos = 0u64;
+        while pos < la {
+            let take = ((SCAN_BUF as u64).min(la - pos)) as usize;
+            a.read_at(pos, &mut va[..take]);
+            b.read_at(pos, &mut vb[..take]);
+            for i in 0..take {
+                if va[i] != vb[i] {
+                    diffs.push((pos + i as u64, va[i], vb[i]));
+                }
+            }
+            pos += take as u64;
+        }
+        return Ok(ContentDiff::Replaces(diffs));
+    }
+    // 变长：公共前缀
+    let common = la.min(lb);
+    let mut prefix = 0u64;
+    while prefix < common {
+        let take = ((SCAN_BUF as u64).min(common - prefix)) as usize;
+        a.read_at(prefix, &mut va[..take]);
+        b.read_at(prefix, &mut vb[..take]);
+        if va[..take] == vb[..take] {
+            prefix += take as u64;
+        } else {
+            let i = (0..take).find(|&i| va[i] != vb[i]).unwrap_or(take);
+            prefix += i as u64;
             break;
         }
-        let chunk = &buf[..n];
-        let m_start = pos as usize;
-        let m_end = ((pos + n as u64) as usize).min(mmap.len());
-        // base 与 mmap 的重叠区间（base 比 mmap 长时 saturating 到 0，只查 wanted）
-        let overlap = m_end.saturating_sub(m_start);
-        for i in 0..overlap {
-            let o = pos + i as u64;
-            let b = chunk[i];
-            if b != mmap[m_start + i] {
-                scan.diffs.push((o, b, mmap[m_start + i]));
-                scan.base_at.insert(o, b);
-            } else if wanted.contains(&o) {
-                scan.base_at.insert(o, b);
-            }
-        }
-        // wanted 中超出 mmap 长度但仍处于 base 范围内的偏移
-        for i in overlap..n {
-            let o = pos + i as u64;
-            if wanted.contains(&o) {
-                scan.base_at.insert(o, chunk[i]);
-            }
-        }
-        pos += n as u64;
     }
-    scan.base_len = pos;
-    Ok(scan)
+    // 公共后缀（不超过剩余公共长度）
+    let max_suffix = common - prefix;
+    let mut suffix = 0u64;
+    while suffix < max_suffix {
+        let take = ((SCAN_BUF as u64).min(max_suffix - suffix)) as usize;
+        a.read_at(la - suffix - take as u64, &mut va[..take]);
+        b.read_at(lb - suffix - take as u64, &mut vb[..take]);
+        if va[..take] == vb[..take] {
+            suffix += take as u64;
+        } else {
+            let i = (0..take).find(|&i| va[i] != vb[i]).unwrap_or(take);
+            suffix += i as u64;
+            break;
+        }
+    }
+    let from_mid_len = la - prefix - suffix;
+    let to_mid_len = lb - prefix - suffix;
+    if to_mid_len > MAX_MID_BYTES {
+        return Err(format!("版本差异中段过大（{} 字节，上限 {}），无法处理", to_mid_len, MAX_MID_BYTES));
+    }
+    let mut to_mid = vec![0u8; to_mid_len as usize];
+    let got = b.read_at(prefix, &mut to_mid);
+    if got != to_mid_len as usize {
+        return Err("读取版本差异中段失败".into());
+    }
+    Ok(ContentDiff::Structural { prefix, from_mid_len, to_mid })
 }
 
-/// 校验文件已打开且路径匹配；返回其句柄
-fn require_opened(state: &State<'_, AppState>, file_path: &str) -> Result<Arc<OpenedFile>, String> {
-    // 多标签页：同一文件不会出现在两个标签页，按路径在映射中查找
-    state
-        .find_by_path(file_path)
-        .ok_or_else(|| "文件尚未在已打开的标签页中".into())
+/// 取标签页的 piece 表快照（锁内短暂克隆）
+fn piece_snapshot(tab: &TabState) -> (Vec<Piece>, Vec<u8>) {
+    let pt = tab.edits.lock().unwrap();
+    (pt.pieces().to_vec(), pt.append_buf().to_vec())
 }
 
 /// 记录版本的核心流程（阻塞线程内执行）：
-/// 1. 确保 base.bin 存在（首次记录 = 当前 mmap 全量拷贝）
-/// 2. overlay = 显示内容相对 base 的完整差异（磁盘漂移 + 未保存编辑合并）
+/// 1. 确保 base.bin 存在（首次记录 = 当前磁盘内容全量拷贝）
+/// 2. 对比 base.bin 与当前显示内容（piece 表 + 覆盖层补丁）：等长存 overlay，变长存 structural
 /// 3. 与最新版本内容指纹相同则跳过（返回 None）
 /// 4. 写 v<id>.json.zst，更新 meta.json，执行容量清理
 fn save_version_blocking(
     app: &AppHandle,
     opened: &OpenedFile,
+    pieces: Vec<Piece>,
+    append_buf: Vec<u8>,
     payload: SaveVersionPayload,
 ) -> Result<Option<VersionMeta>, String> {
-    let mmap = opened
-        .mmap_bytes()
-        .ok_or("文件为空，无法记录版本")?;
     let dir = file_dir(app, &opened.path_string());
     fs::create_dir_all(&dir).map_err(|e| format!("创建版本目录失败: {}", e))?;
     let base_path = dir.join("base.bin");
     if !base_path.is_file() {
-        fs::write(&base_path, mmap).map_err(|e| format!("写入基线快照失败: {}", e))?;
+        let disk: &[u8] = opened.mmap_bytes().unwrap_or(&[]);
+        fs::write(&base_path, disk).map_err(|e| format!("写入基线快照失败: {}", e))?;
     }
 
-    // 未保存编辑（相对磁盘）→ 需要其偏移的 base 字节
-    let edits: BTreeMap<u64, u8> = payload.edits.into_iter().collect();
-    let wanted: HashSet<u64> = edits.keys().copied().collect();
-    let scan = scan_base(&base_path, mmap, &wanted)?;
-
-    // 版本 overlay = base 起的全部差异：
-    // - 磁盘相对 base 的漂移（已保存的修改）取 mmap 当前值
-    // - 未保存编辑覆盖其上；与 base 相同的偏移不进 overlay
-    let mut overlay: BTreeMap<u64, u8> = BTreeMap::new();
-    for (o, _base_b, mmap_b) in &scan.diffs {
-        overlay.insert(*o, *mmap_b);
-    }
-    for (o, v) in &edits {
-        match scan.base_at.get(o) {
-            Some(&b) => {
-                if *v != b {
-                    overlay.insert(*o, *v);
-                } else {
-                    overlay.remove(o);
-                }
-            }
-            None => {
-                // 偏移超出 base 长度（文件曾增长）：尽力保留显示值
-                overlay.insert(*o, *v);
-            }
-        }
-    }
+    let mmap: &[u8] = opened.mmap_bytes().unwrap_or(&[]);
+    let display = DisplaySource {
+        mmap,
+        pt: PieceTable::from_parts(pieces, append_buf),
+        patch: payload.edits.iter().copied().collect(),
+    };
+    let base = FileSource::open(&base_path)?;
+    // from = base，to = 显示内容（版本内容 = base + 差异）
+    let (overlay, structural, byte_count) = match diff_sources(&base, &display)? {
+        ContentDiff::Replaces(diffs) => (
+            diffs.iter().map(|&(o, _, v)| (o, v)).collect::<Vec<_>>(),
+            None,
+            diffs.len() as u64,
+        ),
+        ContentDiff::Structural { prefix, from_mid_len, to_mid } => (
+            Vec::new(),
+            Some(StructuralSnap { prefix, base_mid_len: from_mid_len, mid: to_mid.clone() }),
+            from_mid_len + to_mid.len() as u64,
+        ),
+    };
 
     let data = VersionData {
         ops: payload.ops,
         pos: payload.pos,
-        overlay: overlay.into_iter().collect(),
+        overlay,
+        structural,
     };
-    // 内容指纹：ops + pos + overlay（不含 label/time，纯内容比对）
+    // 内容指纹：ops + pos + 差异数据（不含 label/time，纯内容比对）
     let hash = {
         let mut h = Sha256::new();
-        h.update(
-            &serde_json::to_vec(&data.ops).unwrap_or_default(),
-        );
+        h.update(&serde_json::to_vec(&data.ops).unwrap_or_default());
         h.update(&data.pos.to_le_bytes());
         for (o, v) in &data.overlay {
             h.update(&o.to_le_bytes());
             h.update(&[*v]);
+        }
+        if let Some(s) = &data.structural {
+            h.update(&s.prefix.to_le_bytes());
+            h.update(&s.base_mid_len.to_le_bytes());
+            h.update(&(s.mid.len() as u64).to_le_bytes());
+            h.update(&s.mid);
         }
         format!("{:x}", h.finalize())
     };
@@ -335,7 +547,7 @@ fn save_version_blocking(
         id,
         time: now_ms(),
         label: payload.label,
-        byte_count: data.overlay.len() as u64,
+        byte_count,
         size_bytes: size,
         hash,
     };
@@ -350,17 +562,16 @@ fn save_version_blocking(
 pub async fn save_version(
     app: AppHandle,
     state: State<'_, AppState>,
-    file_path: String,
+    tab_id: String,
     payload: SaveVersionPayload,
 ) -> Result<Option<VersionMeta>, String> {
-    let opened = require_opened(&state, &file_path)?;
-    if opened.mmap_bytes().is_none() {
-        return Err("文件为空，无法记录版本".into());
-    }
+    let tab = state.get_tab(&tab_id).ok_or("尚未打开文件")?;
+    let opened = tab.file.clone();
+    let (pieces, append_buf) = piece_snapshot(&tab);
     let lock = state.versions_lock.clone();
     let handle = tauri::async_runtime::spawn_blocking(move || {
         let _guard = lock.lock().unwrap();
-        save_version_blocking(&app, &opened, payload)
+        save_version_blocking(&app, &opened, pieces, append_buf, payload)
     });
     handle
         .await
@@ -372,12 +583,11 @@ pub async fn save_version(
 fn load_version_diff_blocking(
     app: &AppHandle,
     opened: &OpenedFile,
+    pieces: Vec<Piece>,
+    append_buf: Vec<u8>,
     version_id: &str,
     edits: Vec<(u64, u8)>,
 ) -> Result<VersionDiff, String> {
-    let mmap = opened
-        .mmap_bytes()
-        .ok_or("文件为空")?;
     let dir = file_dir(app, &opened.path_string());
     let compressed = fs::read(version_file(&dir, version_id))
         .map_err(|_| "版本数据不存在或已删除".to_string())?;
@@ -386,41 +596,37 @@ fn load_version_diff_blocking(
     let data: VersionData =
         serde_json::from_slice(&json).map_err(|e| format!("解析版本数据失败: {}", e))?;
 
-    let vmap: BTreeMap<u64, u8> = data.overlay.into_iter().collect();
-    let emap: BTreeMap<u64, u8> = edits.into_iter().collect();
-    let mut wanted: HashSet<u64> = vmap.keys().copied().collect();
-    wanted.extend(emap.keys().copied());
-    let scan = scan_base(&dir.join("base.bin"), mmap, &wanted)?;
-
-    // 候选偏移 = 磁盘漂移 ∪ 版本 overlay ∪ 当前未保存编辑
-    let mut offsets: BTreeSet<u64> = scan.diffs.iter().map(|d| d.0).collect();
-    offsets.extend(vmap.keys());
-    offsets.extend(emap.keys());
-
-    let mut changes = Vec::new();
-    let mut skipped: u64 = 0;
-    for o in offsets {
-        if o >= mmap.len() as u64 {
-            skipped += 1; // 版本内容位置超出当前文件（文件曾被截断），跳过
-            continue;
-        }
-        let cur = emap.get(&o).copied().unwrap_or(mmap[o as usize]);
-        let target = match vmap.get(&o) {
-            Some(&v) => v,
-            None => match scan.base_at.get(&o) {
-                Some(&b) => b,
-                None => continue, // 超出 base 长度且版本未覆盖：无定义，跳过
-            },
-        };
-        if cur != target {
-            changes.push(VersionDiffChange {
-                offset: o,
-                old_value: cur,
-                new_value: target,
-            });
-        }
+    let version_src = VersionSource {
+        base: FileSource::open(&dir.join("base.bin"))?,
+        overlay: data.overlay.iter().copied().collect(),
+        structural: data.structural.clone(),
+    };
+    let mmap: &[u8] = opened.mmap_bytes().unwrap_or(&[]);
+    let display = DisplaySource {
+        mmap,
+        pt: PieceTable::from_parts(pieces, append_buf),
+        patch: edits.iter().copied().collect(),
+    };
+    // from = 当前显示内容，to = 版本内容
+    match diff_sources(&display, &version_src)? {
+        ContentDiff::Replaces(diffs) => Ok(VersionDiff {
+            changes: diffs
+                .into_iter()
+                .map(|(offset, old_value, new_value)| VersionDiffChange { offset, old_value, new_value })
+                .collect(),
+            skipped: 0,
+            structural: None,
+        }),
+        ContentDiff::Structural { prefix, from_mid_len, to_mid } => Ok(VersionDiff {
+            changes: Vec::new(),
+            skipped: 0,
+            structural: Some(StructuralDiff {
+                offset: prefix,
+                delete_len: from_mid_len,
+                insert_bytes: to_mid,
+            }),
+        }),
     }
-    Ok(VersionDiff { changes, skipped })
 }
 
 /// 载入版本并计算与当前显示内容的差异
@@ -428,15 +634,17 @@ fn load_version_diff_blocking(
 pub async fn load_version_diff(
     app: AppHandle,
     state: State<'_, AppState>,
-    file_path: String,
+    tab_id: String,
     version_id: String,
     edits: Vec<(u64, u8)>,
 ) -> Result<VersionDiff, String> {
-    let opened = require_opened(&state, &file_path)?;
+    let tab = state.get_tab(&tab_id).ok_or("尚未打开文件")?;
+    let opened = tab.file.clone();
+    let (pieces, append_buf) = piece_snapshot(&tab);
     let lock = state.versions_lock.clone();
     let handle = tauri::async_runtime::spawn_blocking(move || {
         let _guard = lock.lock().unwrap();
-        load_version_diff_blocking(&app, &opened, &version_id, edits)
+        load_version_diff_blocking(&app, &opened, pieces, append_buf, &version_id, edits)
     });
     handle
         .await

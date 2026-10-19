@@ -67,6 +67,14 @@ export interface FileStats {
   high: number;
   zero: number;
   lineBreaks: number;
+  /** 逐字节值分布（0x00..=0xFF 出现次数），与统计扫描一次遍历同时得到 */
+  histogram: number[];
+}
+
+/** 对比模式的差异区间（两边文件在 [start, start+len) 内不同，或该区间只存在于较长一侧） */
+export interface DiffRange {
+  start: number;
+  len: number;
 }
 
 export interface PerfInfo {
@@ -135,6 +143,16 @@ export interface TabInfo {
   path: string;
 }
 
+/** 对比标签页（v1.1.4）：左右并排两个文件，只读 */
+export interface DiffTabInfo {
+  id: string;
+  kind: 'diff';
+  pathA: string;
+  pathB: string;
+}
+
+export type AnyTabInfo = TabInfo | DiffTabInfo;
+
 /** 字节级选择（含首尾） */
 export interface Selection {
   start: number;
@@ -153,4 +171,81 @@ export interface Bookmark {
   /** 预设调色板颜色（#rrggbb） */
   color: string;
   createdAt: number;
+}
+
+// ============ 可变长度编辑（v1.1.4） ============
+
+/** 等长替换操作的单条字节修改 */
+export interface ByteChange {
+  offset: number;
+  oldValue: number;
+  newValue: number;
+}
+
+/** 结构性原语：一次插入或删除（复合操作与坐标映射的最小单元） */
+export type StructPrim =
+  | { kind: 'insert'; offset: number; bytes: number[] }
+  | { kind: 'delete'; offset: number; bytes: number[] };
+
+/** 编辑历史操作（等长替换 / 插入 / 删除 / 复合） */
+export type EditOp =
+  | {
+      id: string;
+      label: string;
+      time: number;
+      kind: 'replace';
+      changes: ByteChange[];
+    }
+  | {
+      id: string;
+      label: string;
+      time: number;
+      kind: 'insert';
+      offset: number;
+      bytes: number[];
+    }
+  | {
+      id: string;
+      label: string;
+      time: number;
+      kind: 'delete';
+      offset: number;
+      /** 被删除的内容（撤销 / 重做时用于原样恢复） */
+      bytes: number[];
+    }
+  | {
+      id: string;
+      label: string;
+      time: number;
+      kind: 'composite';
+      /** 子操作序列（版本恢复 / 保存点回退等场景的复合变更） */
+      ops: EditOp[];
+    };
+
+/** 历史快照（autosave / 版本记录用） */
+export interface EditSnapshot {
+  ops: EditOp[];
+  pos: number;
+  diskOps: number;
+}
+
+/** 命令面板条目（App 全局命令 + FileTab 文件命令两层注册表） */
+export interface CommandDef {
+  id: string;
+  label: string;
+  category: string;
+  /** 快捷键提示（可选，仅展示） */
+  shortcut?: string;
+}
+
+/** 崩溃恢复检测到的自动保存信息 */
+export interface AutosaveInfo {
+  time: number;
+  payload: {
+    ops: EditOp[];
+    pos: number;
+    diskOps: number;
+    cursor: number | null;
+    selection: Selection | null;
+  };
 }

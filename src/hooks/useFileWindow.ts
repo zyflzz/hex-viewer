@@ -42,6 +42,9 @@ export function useFileWindow(tabId: string) {
   const viewCenterChunkRef = useRef(0);
   // fileMeta 的同步镜像，避免 fetchChunk 依赖 state 导致闭包过期
   const fileMetaRef = useRef<FileMeta | null>(null);
+  // 虚拟大小的同步镜像（磁盘大小 + 未保存结构编辑增量）；
+  // 插入/删除后由 FileTab 调 setVirtualSize 更新，分片边界一律以它为准
+  const virtualSizeRef = useRef(0);
 
   const bumpCache = useCallback(() => {
     setCacheVersion(v => v + 1);
@@ -70,7 +73,7 @@ export function useFileWindow(tabId: string) {
       const map = chunksRef.current;
       const pending = pendingRef.current;
       if (map.has(chunkIndex) || pending.has(chunkIndex)) return;
-      const size = fileMetaRef.current?.size ?? 0;
+      const size = virtualSizeRef.current;
       const chunkOffset = chunkIndex * CHUNK_SIZE;
       if (chunkOffset >= size) return;
       pending.add(chunkIndex);
@@ -109,6 +112,7 @@ export function useFileWindow(tabId: string) {
       chunksRef.current.clear();
       pendingRef.current.clear();
       fileMetaRef.current = meta;
+      virtualSizeRef.current = meta.size;
       setFileMeta(meta);
       setCacheBytes(0);
       setCacheVersion(v => v + 1);
@@ -119,6 +123,24 @@ export function useFileWindow(tabId: string) {
     },
     [fetchChunk],
   );
+
+  /**
+   * 结构性编辑（插入/删除）后更新虚拟大小。
+   * 注意：结构命令已先于本调用发出（Tauri 同步命令按 IPC 顺序执行），
+   * 之后的 read_chunk 都会命中 Rust piece 表的新状态。
+   */
+  const setVirtualSize = useCallback((size: number) => {
+    virtualSizeRef.current = Math.max(0, Math.floor(size));
+  }, []);
+
+  /** 全量失效分片缓存（结构编辑后字节平移，旧分片内容全部作废），不主动预取 */
+  const invalidateAll = useCallback(() => {
+    tokenRef.current += 1;
+    chunksRef.current.clear();
+    pendingRef.current.clear();
+    setCacheBytes(0);
+    setCacheVersion(v => v + 1);
+  }, []);
 
   const openFile = useCallback(async (path: string): Promise<FileMeta> => {
     const meta = await invoke<FileMeta>('open_file', { path, tabId });
@@ -131,7 +153,7 @@ export function useFileWindow(tabId: string) {
    */
   const ensureRange = useCallback(
     (startByte: number, endByte: number) => {
-      const size = fileMetaRef.current?.size ?? 0;
+      const size = virtualSizeRef.current;
       if (size <= 0 || endByte < startByte) return;
       const token = tokenRef.current;
       const firstChunk = Math.floor(startByte / CHUNK_SIZE);
@@ -185,7 +207,7 @@ export function useFileWindow(tabId: string) {
    * 读取任意字节范围（用于复制）：缺的分片补拉后拼装
    */
   const readRange = useCallback(async (offset: number, len: number): Promise<Uint8Array> => {
-    const size = fileMetaRef.current?.size ?? 0;
+    const size = virtualSizeRef.current;
     const end = Math.min(offset + len, size);
     if (offset >= end) return new Uint8Array(0);
     const out = new Uint8Array(end - offset);
@@ -228,6 +250,7 @@ export function useFileWindow(tabId: string) {
     chunksRef.current.clear();
     pendingRef.current.clear();
     fileMetaRef.current = null;
+    virtualSizeRef.current = 0;
     setFileMeta(null);
     setCacheBytes(0);
     setLoading(false);
@@ -252,5 +275,7 @@ export function useFileWindow(tabId: string) {
     ensureRange,
     getBytes,
     readRange,
+    setVirtualSize,
+    invalidateAll,
   };
 }

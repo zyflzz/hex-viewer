@@ -35,6 +35,16 @@ interface SidebarEditProps {
   onPasteHex: () => void;
   /** 按当前显示编码粘贴文本 */
   onPasteText: () => void;
+  /** 在光标/选择起点前插入字节（Insert 键，弹对话框） */
+  onInsert: () => void;
+  /** 删除选中区间 / 光标处单字节（Delete 键） */
+  onDeleteRange: () => void;
+  /** 剪切选中区间（Ctrl+X：复制 + 删除） */
+  onCut: () => void;
+  /** 把剪贴板内容插入到光标处（Ctrl+Shift+Insert） */
+  onInsertFromClipboard: () => void;
+  /** 当前是否有选中区间（剪切禁用态） */
+  hasSelection: boolean;
   /** 预览历史版本中：禁用编辑/撤销/恢复/放弃 */
   locked?: boolean;
 }
@@ -68,6 +78,11 @@ export function SidebarEdit({
   onFill,
   onPasteHex,
   onPasteText,
+  onInsert,
+  onDeleteRange,
+  onCut,
+  onInsertFromClipboard,
+  hasSelection,
   locked = false,
 }: SidebarEditProps) {
   const hasFile = !!meta && meta.size > 0;
@@ -158,6 +173,38 @@ export function SidebarEdit({
             </button>
             <button
               className="btn mini"
+              disabled={readonly || locked}
+              onClick={onInsert}
+              title="在光标/选择起点前插入字节（Insert 键，支持 Hex / 文本 / 文件）"
+            >
+              插入字节
+            </button>
+            <button
+              className="btn mini"
+              disabled={readonly || locked}
+              onClick={onInsertFromClipboard}
+              title="把剪贴板内容插入到光标处（Ctrl+Shift+Insert）"
+            >
+              插入剪贴板
+            </button>
+            <button
+              className="btn mini danger"
+              disabled={readonly || locked}
+              onClick={onDeleteRange}
+              title="删除选中区间 / 光标处单字节（Delete 键）"
+            >
+              删除
+            </button>
+            <button
+              className="btn mini"
+              disabled={readonly || locked || !hasSelection}
+              onClick={onCut}
+              title="剪切选中区间：复制后删除（Ctrl+X）"
+            >
+              剪切
+            </button>
+            <button
+              className="btn mini"
               disabled={!canUndo || locked}
               onClick={onUndo}
               title="撤销最近一次（Ctrl+Z）"
@@ -184,6 +231,8 @@ export function SidebarEdit({
 
           <p className="edit-tip">
             Enter / Ctrl+E 按当前模式开始编辑 · 直接模式可双击 HEX 字节
+            <br />
+            Insert 在光标处插入 · Delete 删除选中/单字节 · Ctrl+X 剪切选中
             <br />
             Ctrl+Z 撤销 · Ctrl+Shift+Z 恢复 · Ctrl+S 保存 · Ctrl+Shift+S 另存为
             <br />

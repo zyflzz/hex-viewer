@@ -13,6 +13,10 @@ interface ToolbarProps {
   unsaved: boolean;
   /** 关闭当前文件（有未保存修改时 App 层弹确认） */
   onCloseFile: () => void;
+  /** 发起文件对比（App 弹左右文件选择） */
+  onCompare: () => void;
+  /** 已打开的文件标签 ≥ 2 才可对比 */
+  canCompare: boolean;
   // 最近文件
   recentFiles: RecentFile[];
   onOpenRecent: (path: string) => void;
@@ -65,6 +69,8 @@ export function Toolbar(props: ToolbarProps) {
     onOpenFile,
     unsaved,
     onCloseFile,
+    onCompare,
+    canCompare,
     recentFiles,
     onOpenRecent,
     onClearRecent,
@@ -188,6 +194,14 @@ export function Toolbar(props: ToolbarProps) {
           ✕
         </button>
       )}
+      <button
+        className="btn mini"
+        onClick={onCompare}
+        disabled={!canCompare}
+        title="对比两个已打开的文件（只读，同步滚动 + 差异高亮）"
+      >
+        ⇄ 对比
+      </button>
 
       <div className="toolbar-sep" />
 

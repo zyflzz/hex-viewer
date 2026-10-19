@@ -16,10 +16,18 @@ export interface VersionMeta {
   hash: string;
 }
 
-/** 版本内容与当前显示内容的差异（Rust 端计算） */
+/** 变长版本恢复指令：删除 [offset, offset+deleteLen) 后原位插入 insertBytes */
+interface StructuralDiff {
+  offset: number;
+  deleteLen: number;
+  insertBytes: number[];
+}
+
+/** 版本内容与当前显示内容的差异（Rust 端计算；changes 与 structural 互斥） */
 interface VersionDiff {
   changes: { offset: number; oldValue: number; newValue: number }[];
   skipped: number;
+  structural: StructuralDiff | null;
 }
 
 /** 清理选项：三选一 */
@@ -38,15 +46,23 @@ interface EditsApi {
   ops: EditOp[];
   pos: number;
   applyEdit: (changes: ByteChange[], label: string) => void;
+  applyComposite: (inner: EditOp[], label: string) => void;
+  /** 读取"所见即所得"字节（供变长恢复取被删内容） */
+  readDisplayRange: (offset: number, len: number) => Promise<Uint8Array>;
 }
 
 /**
- * 历史版本记录（v1.0.2.003）：
- * - 记录：把当前 ops 快照 + 显示覆盖层存为相对 base.bin 的独立版本
- * - 预览：版本差异叠成临时覆盖层替换显示（只读），退出即还原
- * - 恢复：版本与真实状态的差异作为一个新编辑操作追加（可 Ctrl+Z 撤销），磁盘不变
+ * 历史版本记录（v1.1.4，内容基存储）：
+ * - 记录：当前显示内容（piece 表 + 覆盖层）与基线 base.bin 的差异存为独立版本
+ * - 预览：等长差异叠成临时覆盖层替换显示（只读）；变长版本不支持预览
+ * - 恢复：等长 → 一条替换操作；变长 → 复合操作（删除 + 插入），均可 Ctrl+Z 撤销
+ * - save_version / load_version_diff 按 tabId 定位（对比标签页可持有重复路径）
  */
-export function useFileVersions(fileMeta: FileMeta | null, editsApi: EditsApi) {
+export function useFileVersions(
+  tabId: string,
+  fileMeta: FileMeta | null,
+  editsApi: EditsApi,
+) {
   const [versions, setVersions] = useState<VersionMeta[]>([]);
   const [previewId, setPreviewId] = useState<string | null>(null);
   const [previewOverlay, setPreviewOverlay] = useState<ReadonlyMap<number, number> | null>(null);
@@ -99,7 +115,7 @@ export function useFileVersions(fileMeta: FileMeta | null, editsApi: EditsApi) {
       if (!path) throw new Error('尚未打开文件');
       const { edits, ops, pos } = editsRef.current;
       const saved = await invoke<VersionMeta | null>('save_version', {
-        filePath: path,
+        tabId,
         payload: {
           label,
           ops,
@@ -114,26 +130,29 @@ export function useFileVersions(fileMeta: FileMeta | null, editsApi: EditsApi) {
       }
       return false;
     },
-    [path, refreshGlobalSize],
+    [path, tabId, refreshGlobalSize],
   );
 
-  /** 计算版本与真实状态（磁盘+未保存编辑，不含预览覆盖层）的差异 */
+  /** 计算版本与当前显示内容（piece 表 + 覆盖层，不含预览）的差异 */
   const loadDiff = useCallback(
     async (versionId: string): Promise<VersionDiff> => {
       if (!path) throw new Error('尚未打开文件');
       return invoke<VersionDiff>('load_version_diff', {
-        filePath: path,
+        tabId,
         versionId,
         edits: Array.from(editsRef.current.edits, ([offset, value]) => [offset, value]),
       });
     },
-    [path],
+    [path, tabId],
   );
 
-  /** 进入版本预览：真实编辑 + 版本差异 → 临时覆盖层（替换显示，只读） */
+  /** 进入版本预览：真实编辑 + 版本差异 → 临时覆盖层（替换显示，只读）；变长版本不支持 */
   const enterPreview = useCallback(
     async (versionId: string): Promise<void> => {
       const diff = await loadDiff(versionId);
+      if (diff.structural) {
+        throw new Error('该版本长度与当前内容不同，暂不支持预览，可直接恢复');
+      }
       const overlay = new Map(editsRef.current.edits);
       for (const c of diff.changes) overlay.set(c.offset, c.newValue);
       setPreviewOverlay(overlay);
@@ -151,11 +170,44 @@ export function useFileVersions(fileMeta: FileMeta | null, editsApi: EditsApi) {
     [previewId, enterPreview, exitPreview],
   );
 
-  /** 恢复版本：差异作为一个新编辑操作追加（可撤销）；恢复后展示真实状态，退出预览 */
+  /**
+   * 恢复版本：差异作为一个新编辑操作追加（可撤销）；恢复后展示真实状态，退出预览。
+   * 返回 { changes, skipped, structural } 供调用方提示。
+   */
   const restoreVersion = useCallback(
-    async (versionId: string): Promise<{ changes: number; skipped: number }> => {
+    async (
+      versionId: string,
+    ): Promise<{ changes: number; skipped: number; structural: boolean }> => {
       const diff = await loadDiff(versionId);
       const label = versions.find(v => v.id === versionId)?.label ?? '未知版本';
+      if (diff.structural) {
+        // 变长恢复：读出被删内容 → 复合操作（delete + insert）
+        const s = diff.structural;
+        const deleted = await editsRef.current.readDisplayRange(s.offset, s.deleteLen);
+        editsRef.current.applyComposite(
+          [
+            {
+              id: `vdel-${Date.now()}`,
+              label,
+              time: Date.now(),
+              kind: 'delete',
+              offset: s.offset,
+              bytes: Array.from(deleted),
+            },
+            {
+              id: `vins-${Date.now()}`,
+              label,
+              time: Date.now(),
+              kind: 'insert',
+              offset: s.offset,
+              bytes: s.insertBytes,
+            },
+          ],
+          `恢复至版本 ${label}`,
+        );
+        exitPreview();
+        return { changes: s.deleteLen + s.insertBytes.length, skipped: 0, structural: true };
+      }
       if (diff.changes.length > 0) {
         editsRef.current.applyEdit(
           diff.changes.map(c => ({ offset: c.offset, oldValue: c.oldValue, newValue: c.newValue })),
@@ -164,7 +216,7 @@ export function useFileVersions(fileMeta: FileMeta | null, editsApi: EditsApi) {
       }
       // 无论此前预览的是哪个版本：恢复后显示真实编辑状态
       exitPreview();
-      return { changes: diff.changes.length, skipped: diff.skipped };
+      return { changes: diff.changes.length, skipped: diff.skipped, structural: false };
     },
     [versions, loadDiff, exitPreview],
   );

@@ -55,6 +55,14 @@ interface SidebarProps {
   onPasteHex: () => void;
   /** 按当前显示编码粘贴文本 */
   onPasteText: () => void;
+  /** 在光标/选择起点前插入字节（弹对话框） */
+  onInsert: () => void;
+  /** 删除选中区间 / 光标处单字节 */
+  onDeleteRange: () => void;
+  /** 剪切选中区间（复制 + 删除） */
+  onCut: () => void;
+  /** 把剪贴板内容插入到光标处 */
+  onInsertFromClipboard: () => void;
   /** 数据检查器（渲染在"信息"选项卡底部，自带节结构） */
   inspector?: ReactNode;
   /** 历史版本选项卡内容（独立于编辑选项卡） */
@@ -115,6 +123,10 @@ export function Sidebar(props: SidebarProps) {
     onFill,
     onPasteHex,
     onPasteText,
+    onInsert,
+    onDeleteRange,
+    onCut,
+    onInsertFromClipboard,
     inspector,
     versionsPane,
     versionsCount,
@@ -256,6 +268,11 @@ export function Sidebar(props: SidebarProps) {
             onFill={onFill}
             onPasteHex={onPasteHex}
             onPasteText={onPasteText}
+            onInsert={onInsert}
+            onDeleteRange={onDeleteRange}
+            onCut={onCut}
+            onInsertFromClipboard={onInsertFromClipboard}
+            hasSelection={hasSelection}
             locked={previewActive}
           />
         </div>

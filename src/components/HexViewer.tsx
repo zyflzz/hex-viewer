@@ -14,6 +14,8 @@ import { byteClass, byteToAscii, hexByte, hexOffset, offsetDigits } from '../uti
 
 export interface HexViewerHandle {
   scrollToOffset: (offset: number) => void;
+  /** 滚动到指定行（顶部对齐；对比模式同步滚动用） */
+  scrollToRowTop: (row: number) => void;
   /** 聚焦视图容器（恢复键盘导航；编辑框/对话框卸载后焦点会落到 body） */
   focus: () => void;
 }
@@ -51,6 +53,11 @@ interface HexViewerProps {
   readOnly?: boolean;
   /** 搜索命中偏移（升序，引用稳定：App useMemo）；null/空 = 无高亮 */
   hitOffsets: number[] | null;
+  /**
+   * 区间命中集合（对比模式差异高亮）：对象只需支持 has()（二分实现即可），
+   * 与 hitOffsets 高亮样式一致；与 hitOffsets 独立、可同时生效
+   */
+  markSet?: ReadonlySet<number> | null;
   /** 当前活跃命中（侧栏点选/替换导航），比普通命中更醒目 */
   activeHitOffset: number | null;
   /** 右键菜单：offset 为点击的字节（偏移列上为该行首字节），不可解析为 null */
@@ -394,6 +401,7 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
     selectionAnchor,
     onSelectionAnchorChange,
     onHistoryNav,
+    markSet = null,
   },
   ref,
 ) {
@@ -426,6 +434,9 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
     () => ({
       scrollToOffset: (offset: number) => {
         virtualizer.scrollToIndex(Math.floor(offset / rowBytes), { align: 'center' });
+      },
+      scrollToRowTop: (row: number) => {
+        virtualizer.scrollToIndex(row, { align: 'start' });
       },
       focus: () => {
         parentRef.current?.focus({ preventScroll: true });
@@ -765,7 +776,7 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
                 bookmarks={bookmarks}
                 edits={edits}
                 editTarget={editTargetInRow}
-                hitSet={hitsByRow?.get(v.index) ?? null}
+                hitSet={hitsByRow?.get(v.index) ?? markSet}
                 activeHit={activeHitInRow}
                 byteGrouping={byteGrouping}
                 rowHighlight={rowHighlight}

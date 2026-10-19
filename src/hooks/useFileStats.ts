@@ -32,7 +32,13 @@ export function useFileStats(tabId: string, fileMeta: FileMeta | null) {
 
   useEffect(() => {
     if (!fileMeta || fileMeta.size === 0) {
-      setState({ running: false, progress: 0, stats: fileMeta ? { total: 0, printable: 0, control: 0, high: 0, zero: 0, lineBreaks: 0 } : null });
+      setState({
+        running: false,
+        progress: 0,
+        stats: fileMeta
+          ? { total: 0, printable: 0, control: 0, high: 0, zero: 0, lineBreaks: 0, histogram: new Array(256).fill(0) }
+          : null,
+      });
       return;
     }
     const token = ++tokenRef.current;

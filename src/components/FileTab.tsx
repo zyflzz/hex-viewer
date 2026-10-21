@@ -17,22 +17,31 @@ import { EditDialog } from './EditDialog';
 import { ConfirmDialog } from './ConfirmDialog';
 import { FillDialog } from './FillDialog';
 import { InsertDialog } from './InsertDialog';
+import { ExportChatDialog } from './ExportChatDialog';
+import { AiTemplateDialog, type TemplateInput } from './AiTemplateDialog';
+import { BackupRestoreDialog } from './BackupRestoreDialog';
 import { ContextMenu, type ContextMenuEntry } from './ContextMenu';
 import { DataInspector } from './DataInspector';
 import { SidebarVersions } from './SidebarVersions';
 import { SidebarAi } from './SidebarAi';
 import { SidebarAnalyze } from './SidebarAnalyze';
 import { useFileWindow } from '../hooks/useFileWindow';
-import { useFileEdits, type StructAction } from '../hooks/useFileEdits';
+import { useFileEdits, type EditOp, type StructAction } from '../hooks/useFileEdits';
 import { useFileSearch, type SearchMode } from '../hooks/useFileSearch';
 import { useFileStats } from '../hooks/useFileStats';
 import { useFileBookmarks } from '../hooks/useFileBookmarks';
 import { useFileVersions, type CleanupOptions } from '../hooks/useFileVersions';
+import { useFileTemplates } from '../hooks/useFileTemplates';
 import { useAiChat } from '../hooks/useAiChat';
 import { useStringExtract } from '../hooks/useStringExtract';
 import type { AiConfig } from '../hooks/useAiConfig';
 import { streamChat, type ApiChatMessage } from '../utils/aiClient';
 import { buildAiContext } from '../utils/aiContext';
+import {
+  isBlockSelection,
+  linearToBlock,
+  normalizeSelection,
+} from '../utils/selection';
 import type {
   AutosaveInfo,
   Bookmark,
@@ -40,9 +49,11 @@ import type {
   DisplayConfig,
   FileMeta,
   FileTabStatus,
+  SaveResult,
   Selection,
   SidebarTab,
   StringHit,
+  TemplateField,
   TextEncoding,
 } from '../types';
 import {
@@ -133,6 +144,10 @@ interface FileTabProps {
   onEditModeChange: (m: DisplayConfig['editMode']) => void;
   onConfirmSaveChange: (v: boolean) => void;
   onVersionModeChange: (m: DisplayConfig['versionMode']) => void;
+  // 数据安全设置（v1.1.5：自动备份 / 保存后校验，App 持有全局共享）
+  onBackupEnabledChange: (v: boolean) => void;
+  onBackupCountChange: (n: DisplayConfig['backupCount']) => void;
+  onVerifySaveChange: (v: boolean) => void;
   // AI 全局配置（App 持有，跨标签页共享）
   aiConfig: AiConfig;
   onAiConfigChange: (patch: Partial<AiConfig>) => void;
@@ -188,6 +203,9 @@ export const FileTab = memo(
       onEditModeChange,
       onConfirmSaveChange,
       onVersionModeChange,
+      onBackupEnabledChange,
+      onBackupCountChange,
+      onVerifySaveChange,
       aiConfig,
       onAiConfigChange,
       onAiResetSystemPrompt,
@@ -230,6 +248,7 @@ export const FileTab = memo(
     });
     const aiChat = useAiChat(fileMeta);
     const strings = useStringExtract(tabId, fileMeta);
+    const tpl = useFileTemplates(fileMeta?.path ?? null);
 
     // ---------- 显示大小（虚拟偏移语义） ----------
 
@@ -263,9 +282,20 @@ export const FileTab = memo(
 
     // 填充对话框 / 插入对话框 / 右键菜单 / "从此处开始选择"锚点
     const [fillRange, setFillRange] = useState<{ start: number; end: number } | null>(null);
+    /** 块选择的按行填充区间（非 null 时填充对话框以汇总形式展示） */
+    const [fillBlockRanges, setFillBlockRanges] = useState<Array<[number, number]> | null>(null);
     const [insertAt, setInsertAt] = useState<number | null>(null);
     const [ctxMenu, setCtxMenu] = useState<{ x: number; y: number; offset: number } | null>(null);
     const [selectionAnchor, setSelectionAnchor] = useState<number | null>(null);
+
+    // v1.1.5：对话导出 / AI 生成模板 / 从备份恢复
+    const [exportOpen, setExportOpen] = useState(false);
+    const [templateInput, setTemplateInput] = useState<TemplateInput | null>(null);
+    const [backupsOpen, setBackupsOpen] = useState(false);
+    /** 待确认恢复的备份文件名 */
+    const [pendingRestore, setPendingRestore] = useState<string | null>(null);
+    /** 恢复进行中（防止重复提交） */
+    const [restoring, setRestoring] = useState(false);
 
     // 编辑状态：直接模式行内编辑目标 / 对话框编辑区间 / 各确认弹窗 / 保存中
     const [directEditOffset, setDirectEditOffset] = useState<number | null>(null);
@@ -332,7 +362,10 @@ export const FileTab = memo(
         return o;
       };
       if (cursorOffset !== null) setCursorOffset(Math.min(chain(cursorOffset), Math.max(0, displaySize - 1)));
-      if (selection) {
+      if (isBlockSelection(selection)) {
+        // 块选择按行列定位，结构变更后行边界已平移，语义失效 → 直接清空
+        setSelection(null);
+      } else if (selection) {
         const s = chain(selection.start);
         const e = chain(selection.end);
         setSelection({ start: Math.min(s, e), end: Math.min(Math.max(s, e), Math.max(0, displaySize - 1)) });
@@ -507,11 +540,15 @@ export const FileTab = memo(
       [bm],
     );
 
-    /** 把当前选择区间转成标记；成功后切到书签选项卡 */
+    /** 把当前选择区间转成标记；成功后切到书签选项卡（块选择语义不明确，提示改用线性选择） */
     const addMarkFromSelection = useCallback(() => {
       if (ver.previewing) return;
       if (!selection) {
         showToast('请先选择一个区间');
+        return;
+      }
+      if (isBlockSelection(selection)) {
+        showToast('块选择不支持转为标记，请使用线性选择');
         return;
       }
       bm.addMark(selection.start, selection.end);
@@ -615,38 +652,46 @@ export const FileTab = memo(
       [getBytes, displayEdits],
     );
 
-    /** 复制选中字节（Hex / 按指定编码解码的文本） */
+    /** 复制选中字节（Hex / 按指定编码解码的文本）；块选择按行拼接，行间以换行分隔 */
     const copySelection = useCallback(
       async (mode: 'hex' | 'text', encoding: TextEncoding = config.encoding) => {
         if (!selection) return;
-        const len = selection.end - selection.start + 1;
-        if (len > MAX_COPY_BYTES) {
-          showToast(`选择过大（${len} 字节），上限 4MB`);
+        const { ranges, totalBytes } = normalizeSelection(selection, config.bytesPerRow, displaySize);
+        if (ranges.length === 0) return;
+        if (totalBytes > MAX_COPY_BYTES) {
+          showToast(`选择过大（${totalBytes} 字节），上限 4MB`);
           return;
         }
+        const isBlock = isBlockSelection(selection);
         try {
-          const data = await readRange(selection.start, len);
-          // 应用显示覆盖层：复制内容与视图所见一致（含版本预览）
-          for (let i = 0; i < data.length; i++) {
-            const v = displayEdits.get(selection.start + i);
-            if (v !== undefined) data[i] = v;
+          // 逐区间读取并应用显示覆盖层（复制内容与视图所见一致，含版本预览）
+          const lineTexts: string[] = [];
+          for (const [start, end] of ranges) {
+            const data = await readRange(start, end - start + 1);
+            for (let i = 0; i < data.length; i++) {
+              const v = displayEdits.get(start + i);
+              if (v !== undefined) data[i] = v;
+            }
+            if (mode === 'hex') {
+              const parts = new Array<string>(data.length);
+              for (let i = 0; i < data.length; i++) parts[i] = hexByte(data[i]);
+              lineTexts.push(parts.join(' '));
+            } else {
+              lineTexts.push(decodeBytesToText(data, encoding));
+            }
           }
-          let text: string;
-          if (mode === 'hex') {
-            const parts = new Array<string>(data.length);
-            for (let i = 0; i < data.length; i++) parts[i] = hexByte(data[i]);
-            text = parts.join(' ');
-          } else {
-            text = decodeBytesToText(data, encoding);
-          }
-          await writeClipboard(text);
-          showToast(`已复制 ${len} 字节（${mode === 'hex' ? 'Hex' : `${encodingLabel(encoding)} 文本`}）`);
+          // 线性选择为单区间（无换行）；块选择按行拼接（行间 \n）
+          await writeClipboard(lineTexts.join('\n'));
+          const extra = isBlock ? `（块选择 ${ranges.length} 行）` : '';
+          showToast(
+            `已复制 ${totalBytes} 字节${extra}（${mode === 'hex' ? 'Hex' : `${encodingLabel(encoding)} 文本`}）`,
+          );
         } catch (err) {
           console.error(err);
           showToast('复制失败');
         }
       },
-      [selection, readRange, showToast, config.encoding, displayEdits],
+      [selection, readRange, showToast, config.encoding, config.bytesPerRow, displaySize, displayEdits],
     );
 
     // ---------- 编辑：覆盖层应用 / 保存 / 编辑入口 ----------
@@ -657,7 +702,7 @@ export const FileTab = memo(
       [edit.edits],
     );
 
-    /** 就地保存（临时文件 + 原子替换）。返回是否成功（供"保存并关闭"流程使用） */
+    /** 就地保存（自动备份 → 临时文件 → 原子替换 → SHA-256 校验）。返回是否成功（供"保存并关闭"流程使用） */
     const doSave = useCallback(async (): Promise<boolean> => {
       if (!fileMeta || edit.editCount === 0) return true;
       if (fileMeta.is_readonly) {
@@ -671,22 +716,27 @@ export const FileTab = memo(
       if (saving) return false;
       setSaving(true);
       try {
-        const meta = await invoke<FileMeta>('save_file', {
+        const result = await invoke<SaveResult>('save_file', {
           tabId,
           changes: changesPayload,
           path: null,
+          backupCount: config.backupEnabled ? config.backupCount : 0,
+          verify: config.verifySave,
         });
         edit.afterSave(); // 清覆盖层，保留撤销栈（可继续撤销到保存前）
-        resetChunks(meta); // Rust 侧已重新 mmap，重载分片
+        resetChunks(result.meta); // Rust 侧已重新 mmap，重载分片
         // resetChunks 只预载头部分片；用户可能停在文件中部，
         // 可视区间不会自动重新上报（未滚动/未重挂载），手动补拉
         const rb = config.bytesPerRow;
         ensureRange(visibleRange.first * rb, (visibleRange.last + 1) * rb - 1);
         // 立即清除崩溃恢复快照（不等防抖 effect），避免"已保存但快照未清"的窗口
         invoke('clear_autosave', { filePath: path }).catch(() => {});
-        showToast('已保存');
+        // 校验结论反馈：通过 → 校验通过；关闭校验 → 普通"已保存"
+        showToast(
+          config.verifySave ? '已保存（SHA-256 校验通过）' : '已保存',
+        );
         // 自动模式：保存成功后记录一个版本（只读文件不记录；与最新版本相同则静默跳过）
-        if (config.versionMode === 'auto' && !meta.is_readonly) {
+        if (config.versionMode === 'auto' && !result.meta.is_readonly) {
           ver.recordVersion(makeVersionLabel('自动')).catch(err => console.error(err));
         }
         return true;
@@ -706,13 +756,16 @@ export const FileTab = memo(
       showToast,
       config.bytesPerRow,
       config.versionMode,
+      config.backupEnabled,
+      config.backupCount,
+      config.verifySave,
       ensureRange,
       visibleRange,
       ver,
       tabId,
     ]);
 
-    /** 另存为：写目标路径，当前文件与覆盖层均保持不变 */
+    /** 另存为：写目标路径，当前文件与覆盖层均保持不变（不触发自动备份；校验目标文件） */
     const doSaveAs = useCallback(async () => {
       if (!fileMeta || saving) return;
       if (ver.previewing) {
@@ -723,9 +776,15 @@ export const FileTab = memo(
         const target = await saveFileDialog({ defaultPath: fileMeta.path });
         if (!target) return;
         setSaving(true);
-        await invoke<FileMeta>('save_file', { tabId, changes: changesPayload, path: target });
+        await invoke<SaveResult>('save_file', {
+          tabId,
+          changes: changesPayload,
+          path: target,
+          backupCount: 0, // 另存为不覆盖任何旧文件，不做备份
+          verify: config.verifySave,
+        });
         const name = (target as string).split(/[\\/]/).pop() ?? '新文件';
-        showToast(`已另存为 ${name}`);
+        showToast(config.verifySave ? `已另存为 ${name}（校验通过）` : `已另存为 ${name}`);
         // 自动模式：另存为成功同样记录当前内容为一个版本
         if (config.versionMode === 'auto' && !fileMeta.is_readonly) {
           ver.recordVersion(makeVersionLabel('自动')).catch(err => console.error(err));
@@ -736,7 +795,7 @@ export const FileTab = memo(
       } finally {
         setSaving(false);
       }
-    }, [fileMeta, changesPayload, saving, config.versionMode, ver, showToast, tabId]);
+    }, [fileMeta, changesPayload, saving, config.versionMode, config.verifySave, ver, showToast, tabId]);
 
     /** Ctrl+S：可选保存前确认 */
     const handleSaveShortcut = useCallback(() => {
@@ -787,12 +846,16 @@ export const FileTab = memo(
       // 开始编辑即切到编辑选项卡（两种模式都生效），便于查看操作记录
       setActiveSidebarTab('edit');
       if (config.editMode === 'direct') {
-        handleEditStart(cursorOffset ?? selection!.start);
+        // 块选择不提供单字节起点，退回光标处
+        handleEditStart(cursorOffset ?? (selection && !isBlockSelection(selection) ? selection.start : null) ?? 0);
         return;
       }
-      const range =
-        selection ??
-        (cursorOffset !== null ? { start: cursorOffset, end: cursorOffset } : null);
+      const range = isBlockSelection(selection)
+        ? // 块选择的"区间编辑"语义不明确：编辑光标处单字节
+          cursorOffset !== null
+          ? { start: cursorOffset, end: cursorOffset }
+          : null
+        : selection ?? (cursorOffset !== null ? { start: cursorOffset, end: cursorOffset } : null);
       if (!range) return;
       setEditDialogRange(range);
     }, [fileMeta, displaySize, config.editMode, cursorOffset, selection, handleEditStart, ver.previewing, showToast]);
@@ -1000,7 +1063,7 @@ export const FileTab = memo(
       [canEditNow, ver.previewing, search, readDisplayRange, edit, showToast],
     );
 
-    /** 填充入口：校验后弹对话框（无选中时提示） */
+    /** 填充入口：校验后弹对话框（无选中时提示；块选择按行填充） */
     const startFill = useCallback(() => {
       if (!fileMeta || displaySize === 0) return;
       if (ver.previewing) {
@@ -1015,33 +1078,59 @@ export const FileTab = memo(
         showToast('请先选择要填充的区间');
         return;
       }
+      if (isBlockSelection(selection)) {
+        const { ranges, totalBytes } = normalizeSelection(selection, config.bytesPerRow, displaySize);
+        if (ranges.length === 0 || totalBytes === 0) {
+          showToast('块选择范围为空');
+          return;
+        }
+        setFillBlockRanges(ranges);
+        setFillRange({ start: ranges[0][0], end: ranges[ranges.length - 1][1] });
+        return;
+      }
+      setFillBlockRanges(null);
       setFillRange({ start: selection.start, end: selection.end });
-    }, [fileMeta, displaySize, selection, ver.previewing, showToast]);
+    }, [fileMeta, displaySize, selection, config.bytesPerRow, ver.previewing, showToast]);
 
-    /** 填充提交：跳过已等于填充值的字节 */
+    /** 填充提交：跳过已等于填充值的字节；块选择逐行区间作用，一条操作整体撤销 */
     const commitFill = useCallback(
       async (value: number) => {
         const range = fillRange;
+        const blockRanges = fillBlockRanges;
         setFillRange(null);
+        setFillBlockRanges(null);
         if (!range) return;
-        const len = range.end - range.start + 1;
-        const old = await readDisplayRange(range.start, len);
-        const changes: Array<{ offset: number; oldValue: number; newValue: number }> = [];
-        for (let i = 0; i < len; i++) {
-          if (old[i] !== value) {
-            changes.push({ offset: range.start + i, oldValue: old[i], newValue: value });
+        const ranges: Array<[number, number]> = blockRanges ?? [[range.start, range.end]];
+        try {
+          const changes: Array<{ offset: number; oldValue: number; newValue: number }> = [];
+          let filled = 0;
+          for (const [start, end] of ranges) {
+            const len = end - start + 1;
+            const old = await readDisplayRange(start, len);
+            for (let i = 0; i < len; i++) {
+              if (old[i] !== value) {
+                changes.push({ offset: start + i, oldValue: old[i], newValue: value });
+                filled++;
+              }
+            }
           }
+          if (changes.length === 0) {
+            showToast('内容无变化（区间已是该值）');
+            return;
+          }
+          const total = ranges.reduce((n, [s, e]) => n + (e - s + 1), 0);
+          edit.applyEdit(
+            changes,
+            ranges.length > 1
+              ? `块填充 ${ranges.length} 行 = ${hexByte(value)}（${filled} 字节）`
+              : `填充 @${hexOffset(range.start, digits)}–${hexOffset(range.end, digits)} = ${hexByte(value)}（${total} 字节）`,
+          );
+        } catch (err) {
+          console.error(err);
+          showToast('读取当前内容失败');
         }
-        if (changes.length === 0) {
-          showToast('内容无变化（区间已是该值）');
-          return;
-        }
-        edit.applyEdit(
-          changes,
-          `填充 @${hexOffset(range.start, digits)}–${hexOffset(range.end, digits)} = ${hexByte(value)}（${len} 字节）`,
-        );
       },
-      [fillRange, readDisplayRange, edit, digits, showToast],
+      [fillRange, fillBlockRanges, readDisplayRange, edit, digits, showToast],
     );
 
     /**
@@ -1059,7 +1148,10 @@ export const FileTab = memo(
           showToast('文件为只读');
           return;
         }
-        const target = targetOverride ?? cursorOffset ?? selection?.start ?? null;
+        const target =
+          targetOverride ??
+          cursorOffset ??
+          (selection && !isBlockSelection(selection) ? selection.start : null);
         if (target === null) {
           showToast('请先点击一个字节设置光标');
           return;
@@ -1129,7 +1221,7 @@ export const FileTab = memo(
     /** 插入入口（Insert 键 / 侧栏按钮 / 右键菜单）：在光标/选择起点前弹插入对话框 */
     const startInsert = useCallback(() => {
       if (!checkStructEditable()) return;
-      const at = selection?.start ?? cursorOffset;
+      const at = (selection && !isBlockSelection(selection) ? selection.start : null) ?? cursorOffset;
       if (at === null || at === undefined) {
         showToast('请先点击一个字节设置插入点');
         return;
@@ -1150,10 +1242,40 @@ export const FileTab = memo(
       [insertAt, edit, digits, showToast],
     );
 
-    /** 删除区间（Delete 键 / 侧栏按钮 / 右键菜单）：选中区间或光标处单字节 */
+    /** 删除区间（Delete 键 / 侧栏按钮 / 右键菜单）：选中区间或光标处单字节；块选择逐行删除（一条复合操作整体撤销） */
     const doDeleteRange = useCallback(async () => {
       if (!checkStructEditable()) return;
       if (displaySize === 0) return;
+      if (isBlockSelection(selection)) {
+        const { ranges, totalBytes } = normalizeSelection(selection, config.bytesPerRow, displaySize);
+        if (ranges.length === 0) return;
+        try {
+          // 被删内容从当前显示状态读取（原坐标空间），随后按升序 + 偏移前移的方式
+          // 构造复合操作：每个删除的 offset 扣除其前面区间已删除的字节数。
+          // 这样前向应用（IPC 顺序）与撤销反演（逆序插入）都在正确的坐标空间中。
+          const inner: EditOp[] = [];
+          let shift = 0;
+          for (const [s, e] of ranges) {
+            const data = await readDisplayRange(s, e - s + 1);
+            inner.push({
+              id: `blk-${s}-${inner.length}`,
+              label: '',
+              time: 0,
+              kind: 'delete' as const,
+              offset: s - shift,
+              bytes: Array.from(data),
+            });
+            shift += e - s + 1;
+          }
+          edit.applyComposite(inner, `块删除 ${ranges.length} 行（${totalBytes} 字节）`);
+          setSelection(null);
+          showToast(`已删除 ${totalBytes} 字节（可撤销）`);
+        } catch (err) {
+          console.error(err);
+          showToast('读取被删内容失败');
+        }
+        return;
+      }
       const range =
         selection ?? (cursorOffset !== null ? { start: cursorOffset, end: cursorOffset } : null);
       if (!range) {
@@ -1174,13 +1296,53 @@ export const FileTab = memo(
         console.error(err);
         showToast('读取被删内容失败');
       }
-    }, [checkStructEditable, displaySize, selection, cursorOffset, readDisplayRange, edit, digits, showToast]);
+    }, [checkStructEditable, displaySize, selection, config.bytesPerRow, cursorOffset, readDisplayRange, edit, digits, showToast]);
 
-    /** 剪切（Ctrl+X）：复制选中区间（Hex）后删除该区间 */
+    /** 剪切（Ctrl+X）：复制选中区间（Hex）后删除该区间；块选择按行复制 + 逐行删除 */
     const doCut = useCallback(async () => {
       if (!checkStructEditable()) return;
       if (!selection) {
         showToast('请先选择要剪切的区间');
+        return;
+      }
+      if (isBlockSelection(selection)) {
+        const { ranges, totalBytes } = normalizeSelection(selection, config.bytesPerRow, displaySize);
+        if (ranges.length === 0) return;
+        if (totalBytes > MAX_COPY_BYTES) {
+          showToast(`选择过大（${totalBytes} 字节），上限 4MB`);
+          return;
+        }
+        try {
+          const lineTexts: string[] = [];
+          for (const [s, e] of ranges) {
+            const data = await readDisplayRange(s, e - s + 1);
+            const parts = new Array<string>(data.length);
+            for (let i = 0; i < data.length; i++) parts[i] = hexByte(data[i]);
+            lineTexts.push(parts.join(' '));
+          }
+          await writeClipboard(lineTexts.join('\n'));
+          // 与块删除一致的坐标空间约定：升序 + 偏移前移，撤销反演自然成立
+          const inner: EditOp[] = [];
+          let shift = 0;
+          for (const [s, e] of ranges) {
+            const data = await readDisplayRange(s, e - s + 1);
+            inner.push({
+              id: `blkcut-${s}-${inner.length}`,
+              label: '',
+              time: 0,
+              kind: 'delete' as const,
+              offset: s - shift,
+              bytes: Array.from(data),
+            });
+            shift += e - s + 1;
+          }
+          edit.applyComposite(inner, `块剪切 ${ranges.length} 行（${totalBytes} 字节）`);
+          setSelection(null);
+          showToast(`已剪切 ${totalBytes} 字节（块选择 ${ranges.length} 行，可撤销）`);
+        } catch (err) {
+          console.error(err);
+          showToast('剪切失败');
+        }
         return;
       }
       const len = selection.end - selection.start + 1;
@@ -1204,12 +1366,13 @@ export const FileTab = memo(
         console.error(err);
         showToast('剪切失败');
       }
-    }, [checkStructEditable, selection, readDisplayRange, edit, digits, showToast]);
+    }, [checkStructEditable, selection, config.bytesPerRow, displaySize, readDisplayRange, edit, digits, showToast]);
 
     /** 从剪贴板插入（Ctrl+Shift+Insert）：Hex 优先解析，失败按显示编码当文本 */
     const doInsertFromClipboard = useCallback(async () => {
       if (!checkStructEditable()) return;
-      const at = cursorOffset ?? selection?.start ?? null;
+      const at =
+        cursorOffset ?? (selection && !isBlockSelection(selection) ? selection.start : null);
       if (at === null) {
         showToast('请先点击一个字节设置插入点');
         return;
@@ -1300,6 +1463,17 @@ export const FileTab = memo(
           setSelectionAnchor(off);
           showToast('已设置选择起点，点击另一字节完成选择');
         }, !fileMeta || displaySize === 0),
+        item(
+          'toBlock',
+          '把选择转为块选择',
+          () => {
+            if (selection && !isBlockSelection(selection)) {
+              setSelection(linearToBlock(selection, config.bytesPerRow));
+              showToast('已转为块选择（Alt+方向键扩展，Escape 清空）');
+            }
+          },
+          !selection || isBlockSelection(selection),
+        ),
         { key: 'sep4', sep: true },
         item('ai', 'AI 分析选中内容', () => {
           setActiveSidebarTab('ai');
@@ -1323,6 +1497,7 @@ export const FileTab = memo(
       doCut,
       addMarkFromSelection,
       config.editMode,
+      config.bytesPerRow,
       handleEditStart,
       showToast,
       onGotoFill,
@@ -1514,24 +1689,37 @@ export const FileTab = memo(
 
         try {
           if (selection) {
-            const len = selection.end - selection.start + 1;
-            const take = Math.min(len, cfg.maxContextBytes);
-            const data = await readRange(selection.start, take);
-            for (let i = 0; i < data.length; i++) {
-              const v = displayEdits.get(selection.start + i);
-              if (v !== undefined) data[i] = v;
+            const { ranges, totalBytes } = normalizeSelection(selection, config.bytesPerRow, displaySize);
+            if (ranges.length === 0) throw new Error('选择范围为空');
+            const isBlock = isBlockSelection(selection);
+            const take = Math.min(totalBytes, cfg.maxContextBytes);
+            // 逐区间读取（块选择按行裁剪），顺序拼接为上下文
+            const data = new Uint8Array(take);
+            let filled = 0;
+            for (const [s, e] of ranges) {
+              if (filled >= take) break;
+              const n = Math.min(e - s + 1, take - filled);
+              const part = await readRange(s, n);
+              for (let i = 0; i < part.length; i++) {
+                const v = displayEdits.get(s + i);
+                if (v !== undefined) part[i] = v;
+              }
+              data.set(part, filled);
+              filled += n;
             }
+            const first = ranges[0][0];
+            const last = ranges[ranges.length - 1][1];
             contextText = buildAiContext({
               bytes: data,
-              start: selection.start,
-              fullLength: len,
-              truncated: take < len,
-              title: '选中范围',
+              start: first,
+              fullLength: totalBytes,
+              truncated: take < totalBytes,
+              title: isBlock ? `块选择（${ranges.length} 行按行拼接）` : '选中范围',
               cursorOffset,
               cursorByte: await readDisplayByte(cursorOffset ?? -1),
               fileSize,
             });
-            contextMeta = { start: selection.start, end: selection.end, truncated: take < len };
+            contextMeta = { start: first, end: last, truncated: take < totalBytes };
           } else if (cursorOffset !== null && fileSize > 0) {
             // 无选中：光标前后各半共 64 字节，越界时向文件内收缩
             const len = Math.min(AI_CURSOR_CONTEXT, fileSize);
@@ -1648,13 +1836,134 @@ export const FileTab = memo(
           setAiGenerating(false);
         }
       },
-      [aiGenerating, fileMeta, displaySize, aiConfig, aiChat, selection, cursorOffset, readRange, displayEdits],
+      [aiGenerating, fileMeta, displaySize, aiConfig, aiChat, selection, cursorOffset, readRange, displayEdits, config.bytesPerRow],
     );
 
     /** 停止生成：中止流式请求，保留已生成内容 */
     const handleAiStop = useCallback(() => {
       aiAbortRef.current?.abort();
     }, []);
+
+    // ---------- AI 生成模板（v1.1.5） ----------
+
+    /** 打开模板对话框：组装输入（线性选中区间 ≤4KB；无选中取光标附近 64 字节） */
+    const openTemplateDialog = useCallback(async () => {
+      if (aiGenerating) {
+        showToast('AI 正在生成中，请稍候');
+        return;
+      }
+      if (!fileMeta || displaySize === 0) return;
+      try {
+        let start: number;
+        let len: number;
+        let fullLength: number;
+        if (selection && !isBlockSelection(selection)) {
+          start = selection.start;
+          fullLength = selection.end - selection.start + 1;
+          len = Math.min(fullLength, 4096);
+        } else if (cursorOffset !== null) {
+          len = Math.min(64, displaySize);
+          start = Math.max(0, Math.min(cursorOffset - (len >> 1), displaySize - len));
+          fullLength = len;
+        } else {
+          showToast('请先选择一段字节或点击一个字节设置光标');
+          return;
+        }
+        const bytes = await readDisplayRange(start, len);
+        setTemplateInput({
+          bytes,
+          start,
+          fullLength,
+          truncated: len < fullLength,
+          fileSize: displaySize,
+        });
+      } catch (err) {
+        console.error(err);
+        showToast('读取模板输入数据失败');
+      }
+    }, [aiGenerating, fileMeta, displaySize, selection, cursorOffset, readDisplayRange, showToast]);
+
+    /** 应用模板字段：相对偏移换算为绝对偏移，按配色写入字段标记（书签列表"模板字段"分组） */
+    const applyTemplateFields = useCallback(
+      (fields: Array<TemplateField & { color: string }>) => {
+        if (!templateInput || !fileMeta) return;
+        const applied = fields
+          .map(f => ({
+            name: f.name,
+            start: templateInput.start + f.offset,
+            end: Math.min(templateInput.start + f.offset + f.length - 1, displaySize - 1),
+            color: f.color,
+          }))
+          .filter(f => f.start < displaySize && f.end >= f.start);
+        if (applied.length === 0) {
+          showToast('没有可应用的字段（偏移超出文件末尾）');
+          return;
+        }
+        bm.addFields(applied);
+        setTemplateInput(null);
+        setActiveSidebarTab('bookmarks');
+        showToast(`已应用 ${applied.length} 个模板字段（见书签列表"模板字段"）`);
+      },
+      [templateInput, fileMeta, displaySize, bm, showToast],
+    );
+
+    /** 记录一次模板生成到 AI 对话历史（保持会话完整，可回溯） */
+    const recordTemplateExchange = useCallback(
+      (description: string, output: string) => {
+        aiChat.appendMessage({ role: 'user', content: `生成模板：${description}` });
+        aiChat.appendMessage({ role: 'assistant', content: output });
+      },
+      [aiChat],
+    );
+
+    // ---------- 从备份恢复（v1.1.5） ----------
+
+    /** 选中一份备份：关闭列表，弹出覆盖确认 */
+    const handlePickBackup = useCallback((backupName: string) => {
+      setBackupsOpen(false);
+      setPendingRestore(backupName);
+    }, []);
+
+    /** 确认恢复：丢弃未保存编辑 → 后端归档当前内容并覆盖 → 重新打开 */
+    const doRestoreBackup = useCallback(async () => {
+      const name = pendingRestore;
+      if (!name || restoring) return;
+      setRestoring(true);
+      try {
+        edit.discardUnsaved(); // 未保存编辑被覆盖（确认框已提示），回到磁盘状态
+        setSelection(null);
+        await invoke<FileMeta>('restore_backup', {
+          tabId,
+          path,
+          backupName: name,
+          backupCount: config.backupEnabled ? config.backupCount : 1,
+        });
+        setPendingRestore(null);
+        const meta = await openFile(path); // 重开文件：重置句柄与分片缓存
+        setCursorOffset(meta.size > 0 ? 0 : null);
+        resetChunks(meta);
+        ensureRange(0, config.bytesPerRow * 2 - 1);
+        showToast(`已从 ${name} 恢复（恢复前内容已归档一份备份）`);
+      } catch (err) {
+        showToast(`恢复失败: ${err}`);
+        console.error(err);
+      } finally {
+        setRestoring(false);
+      }
+    }, [
+      pendingRestore,
+      restoring,
+      edit,
+      tabId,
+      path,
+      config.backupEnabled,
+      config.backupCount,
+      config.bytesPerRow,
+      openFile,
+      resetChunks,
+      ensureRange,
+      showToast,
+    ]);
 
     /** AI 选项卡徽章：当前会话消息数（用户 + AI 回复） */
     const aiCount = useMemo(
@@ -2028,6 +2337,13 @@ export const FileTab = memo(
               onEditModeChange={onEditModeChange}
               confirmSave={config.confirmSave}
               onConfirmSaveChange={onConfirmSaveChange}
+              backupEnabled={config.backupEnabled}
+              onBackupEnabledChange={onBackupEnabledChange}
+              backupCount={config.backupCount}
+              onBackupCountChange={onBackupCountChange}
+              verifySave={config.verifySave}
+              onVerifySaveChange={onVerifySaveChange}
+              onRestoreBackup={() => setBackupsOpen(true)}
               editCount={edit.editCount}
               canUndo={edit.canUndo}
               canRedo={edit.canRedo}
@@ -2086,6 +2402,8 @@ export const FileTab = memo(
                   onSend={handleAiSend}
                   onStop={handleAiStop}
                   onClearRequest={() => setAiClearConfirmOpen(true)}
+                  onExport={() => setExportOpen(true)}
+                  onGenerateTemplate={() => void openTemplateDialog()}
                   digits={digits}
                 />
               }
@@ -2138,14 +2456,27 @@ export const FileTab = memo(
           />
         )}
 
-        {/* 填充选中区间 */}
+        {/* 填充选中区间（块选择时按行填充，汇总展示） */}
         {fillRange && fileMeta && (
           <FillDialog
             start={fillRange.start}
             end={fillRange.end}
             digits={digits}
+            label={
+              fillBlockRanges
+                ? `块选择 ${fillBlockRanges.length} 行（${fillBlockRanges.reduce((n, [s, e]) => n + (e - s + 1), 0)} 字节）`
+                : undefined
+            }
+            totalBytes={
+              fillBlockRanges
+                ? fillBlockRanges.reduce((n, [s, e]) => n + (e - s + 1), 0)
+                : undefined
+            }
             onCommit={v => void commitFill(v)}
-            onCancel={() => setFillRange(null)}
+            onCancel={() => {
+              setFillRange(null);
+              setFillBlockRanges(null);
+            }}
           />
         )}
 
@@ -2328,6 +2659,62 @@ export const FileTab = memo(
               },
             ]}
             onCancel={() => setAiClearConfirmOpen(false)}
+          />
+        )}
+
+        {/* 导出 AI 会话（v1.1.5） */}
+        {exportOpen && displayMeta && (
+          <ExportChatDialog
+            meta={displayMeta}
+            messages={aiChat.messages}
+            onClose={() => setExportOpen(false)}
+            onToast={showToast}
+          />
+        )}
+
+        {/* AI 生成模板（v1.1.5） */}
+        {templateInput && (
+          <AiTemplateDialog
+            input={templateInput}
+            aiConfig={aiConfig}
+            templates={tpl.templates}
+            onSaveTemplate={(name, fields) => tpl.saveTemplate(name, fields)}
+            onDeleteTemplate={tpl.deleteTemplate}
+            onApply={applyTemplateFields}
+            onRecord={recordTemplateExchange}
+            onClose={() => setTemplateInput(null)}
+            onToast={showToast}
+          />
+        )}
+
+        {/* 从备份恢复：备份列表（v1.1.5） */}
+        {backupsOpen && fileMeta && (
+          <BackupRestoreDialog
+            meta={fileMeta}
+            onClose={() => setBackupsOpen(false)}
+            onRestore={handlePickBackup}
+            onToast={showToast}
+          />
+        )}
+
+        {/* 从备份恢复：覆盖确认 */}
+        {pendingRestore && fileMeta && (
+          <ConfirmDialog
+            title="从备份恢复"
+            message={`将用备份「${pendingRestore}」覆盖当前文件，当前未保存的编辑会被丢弃；恢复前当前内容会先归档一份备份。是否继续？`}
+            buttons={[
+              {
+                label: restoring ? '恢复中…' : '恢复',
+                kind: 'primary',
+                onClick: () => void doRestoreBackup(),
+              },
+              {
+                label: '取消',
+                kind: 'plain',
+                onClick: () => setPendingRestore(null),
+              },
+            ]}
+            onCancel={() => setPendingRestore(null)}
           />
         )}
       </div>

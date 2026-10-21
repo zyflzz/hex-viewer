@@ -6,6 +6,7 @@
 // - 进程内存 / CPU 性能数据
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -61,6 +62,18 @@ pub struct FileMeta {
     extension: String,
     kind: String,
     is_readonly: bool,
+}
+
+/// 保存结果（v1.1.5）：meta + 保存后校验结论
+/// verified = 所有已执行的校验均通过（关闭校验时恒为 true）
+/// hash = 写入时同步累计的 SHA-256（关闭校验时为 None）
+/// verify_stage = 校验失败发生的阶段（"写入临时文件" / "替换原文件"），成功时为 None
+#[derive(Serialize)]
+pub struct SaveResult {
+    pub meta: FileMeta,
+    pub verified: bool,
+    pub hash: Option<String>,
+    pub verify_stage: Option<String>,
 }
 
 impl OpenedFile {
@@ -467,18 +480,95 @@ pub struct ByteChange {
 
 /// 保存的核心流程（阻塞线程内执行）：
 /// 1. 合并同一偏移的多次修改（BTreeMap 自动按偏移有序），偏移按虚拟大小校验
-/// 2. 按 piece 表顺序输出（基线 + 追加缓冲），同时应用覆盖层补丁 → 写同目录临时文件（sync 落盘）
-/// 3. rename 原子替换目标文件
+/// 2. 按 piece 表顺序输出（基线 + 追加缓冲），同时应用覆盖层补丁，
+///    写出时同步累计 SHA-256（零额外 I/O）→ 写同目录临时文件（sync 落盘）
+/// 3. 校验层一：重新读取临时文件计算 SHA-256，与写入时哈希比对（确认数据正确到达临时文件）
+/// 4. 就地保存且开启自动备份：滚动备份当前磁盘文件（<file>.bak / .bak.1 / .bak.2 ...）
+/// 5. rename 原子替换目标文件
+/// 6. 校验层二：对目标文件计算 SHA-256 与写入时哈希比对（确认 rename 后文件系统完整；
+///    超过 500MB 的大文件自动跳过，避免额外一次完整读取）
 ///
 /// 写回原文件时必须先解除 mmap（Windows 上被映射的文件无法被 rename 覆盖），
 /// 成功后重新映射；另存为则不动当前打开的文件。
-/// 返回 (新元数据, 应放回 state 的文件句柄)；失败时句柄为原文件或重开的原文件。
+/// 返回 (保存结果, 应放回 state 的文件句柄)；失败时句柄为原文件或重开的原文件。
+/// 校验层一失败时临时文件保留在磁盘供用户检查。
+const VERIFY_SKIP_SIZE: u64 = 500 * 1024 * 1024;
+
+/// 边写出边累计 SHA-256 的包装写入器（与写盘共享 I/O，无额外读取开销）
+struct HashWriter<W: Write> {
+    inner: W,
+    hasher: Sha256,
+}
+
+impl<W: Write> Write for HashWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.hasher.update(buf);
+        self.inner.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// 分块计算一个磁盘文件的 SHA-256（8MB 缓冲，控制内存占用）
+fn hash_file(path: &Path) -> Result<String, String> {
+    let mut f = fs::File::open(path).map_err(|e| format!("无法打开文件进行校验: {}", e))?;
+    let mut hasher = Sha256::new();
+    let mut buf = vec![0u8; 8 * 1024 * 1024];
+    loop {
+        let n = f.read(&mut buf).map_err(|e| format!("读取文件失败: {}", e))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// 保存前滚动备份：保留 backup_count 份（<file>.bak 最新，.bak.N 最旧）。
+/// 滚动规则：删最旧 → 依次后移 → 当前文件复制为 .bak。备份失败视为保存失败（保护旧内容）。
+fn rolling_backup(path: &str, backup_count: u32) -> Result<(), String> {
+    let p = Path::new(path);
+    let dir = p.parent().ok_or_else(|| "无法确定文件目录".to_string())?;
+    let name = p
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .ok_or_else(|| "无法确定文件名".to_string())?;
+    let bak = |i: u32| {
+        if i == 0 {
+            dir.join(format!("{}.bak", name))
+        } else {
+            dir.join(format!("{}.bak.{}", name, i))
+        }
+    };
+    if backup_count > 1 {
+        // 删最旧一份
+        let _ = fs::remove_file(bak(backup_count - 1));
+        // bak.(i-1) → bak.i（从后往前），rename 目标存在时在 Windows 上为原子替换
+        for i in (2..backup_count).rev() {
+            let from = bak(i - 1);
+            if from.exists() {
+                fs::rename(&from, bak(i)).map_err(|e| format!("备份滚动失败: {}", e))?;
+            }
+        }
+        // bak → bak.1
+        if bak(0).exists() {
+            fs::rename(bak(0), bak(1)).map_err(|e| format!("备份滚动失败: {}", e))?;
+        }
+    }
+    // 当前文件 → bak（覆盖写）
+    fs::copy(path, bak(0)).map_err(|e| format!("创建备份失败: {}", e))?;
+    Ok(())
+}
+
 fn save_file_blocking(
     opened: Arc<OpenedFile>,
     edits: Arc<Mutex<PieceTable>>,
     changes: Vec<ByteChange>,
     path: Option<String>,
-) -> Result<(FileMeta, Arc<OpenedFile>), (String, Option<Arc<OpenedFile>>)> {
+    backup_count: u32,
+    verify: bool,
+) -> Result<(SaveResult, Arc<OpenedFile>), (String, Option<Arc<OpenedFile>>)> {
     let in_place = path.is_none();
     let save_path = path.unwrap_or_else(|| opened.path.clone());
     if in_place && opened.is_readonly {
@@ -514,28 +604,83 @@ fn save_file_blocking(
         .unwrap_or(0);
     let tmp = dir.join(format!(".hexsave-{}-{}", std::process::id(), nanos));
 
-    // 用临时 piece 表按顺序写出（from_append 的 piece 指向本地追加缓冲副本）
+    // 用临时 piece 表按顺序写出（from_append 的 piece 指向本地追加缓冲副本），
+    // 写出的同时累计 SHA-256（与写盘共享 I/O 路径，几乎零额外开销）
     let snap = PieceTable::from_parts(pieces, append_buf);
-    let write = (|| -> std::io::Result<()> {
-        let mut out = fs::File::create(&tmp)?;
-        snap.write_patched(&mut out, src, &merged)?;
-        out.sync_all()?;
-        Ok(())
+    let write_hash = (|| -> std::io::Result<String> {
+        let out = fs::File::create(&tmp)?;
+        let mut hw = HashWriter { inner: out, hasher: Sha256::new() };
+        snap.write_patched(&mut hw, src, &merged)?;
+        hw.inner.sync_all()?;
+        Ok(format!("{:x}", hw.hasher.finalize()))
     })();
-    if let Err(e) = write {
-        let _ = fs::remove_file(&tmp);
-        return Err((format!("写入临时文件失败: {}", e), Some(opened)));
+    let write_hash = match write_hash {
+        Ok(h) => h,
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err((format!("写入临时文件失败: {}", e), Some(opened)));
+        }
+    };
+
+    // 校验层一：临时文件重读比对（确认写出的数据正确到达磁盘）
+    if verify {
+        match hash_file(&tmp) {
+            Ok(h) if h == write_hash => {}
+            Ok(_) => {
+                // 校验失败：临时文件保留供用户检查
+                return Err((
+                    format!(
+                        "写入临时文件校验失败（写入临时文件阶段），磁盘写入可能不完整。\
+                         临时文件已保留供检查: {}",
+                        tmp.display()
+                    ),
+                    Some(opened),
+                ));
+            }
+            Err(e) => {
+                let _ = fs::remove_file(&tmp);
+                return Err((format!("保存校验失败: {}", e), Some(opened)));
+            }
+        }
     }
 
     if !in_place {
-        // 另存为：目标路径覆盖写入，当前打开的文件不受影响
-        return match fs::rename(&tmp, &save_path) {
-            Ok(()) => Ok((FileMeta::from(opened.as_ref()), opened)),
-            Err(e) => {
-                let _ = fs::remove_file(&tmp);
-                Err((format!("另存为失败: {}", e), Some(opened)))
+        // 另存为：目标路径覆盖写入，当前打开的文件不受影响，也不做备份
+        if let Err(e) = fs::rename(&tmp, &save_path) {
+            let _ = fs::remove_file(&tmp);
+            return Err((format!("另存为失败: {}", e), Some(opened)));
+        }
+        // 另存为同样校验目标文件（失败不影响当前打开的文件）
+        if verify {
+            let md = fs::metadata(&save_path).map(|m| m.len()).unwrap_or(0);
+            if md <= VERIFY_SKIP_SIZE
+                && !hash_file(Path::new(&save_path))
+                    .map(|h| h == write_hash)
+                    .unwrap_or(false)
+            {
+                return Err((
+                    "另存为文件校验失败（替换原文件阶段），目标文件内容可能与预期不一致".to_string(),
+                    Some(opened),
+                ));
             }
-        };
+        }
+        return Ok((
+            SaveResult {
+                meta: FileMeta::from(opened.as_ref()),
+                verified: true,
+                hash: if verify { Some(write_hash) } else { None },
+                verify_stage: None,
+            },
+            opened,
+        ));
+    }
+
+    // 就地保存：rename 前先滚动备份当前磁盘内容（保护旧内容；失败则中止保存）
+    if backup_count > 0 {
+        if let Err(e) = rolling_backup(&save_path, backup_count) {
+            let _ = fs::remove_file(&tmp);
+            return Err((format!("自动备份失败，已中止保存: {}", e), Some(opened)));
+        }
     }
 
     // 写回原文件：解除 mmap 后 rename，再重新打开映射
@@ -551,8 +696,36 @@ fn save_file_blocking(
     }
     match open_mapped(&save_path) {
         Ok(reopened) => {
+            // 校验层二：rename 后对目标文件整体比对（从重开的 mmap 读取，零额外文件 I/O）；
+            // 超过阈值的大文件自动跳过（避免 1–2 秒的完整读取）
+            if verify && reopened.size <= VERIFY_SKIP_SIZE {
+                let ok = reopened
+                    .mmap_bytes()
+                    .map(|m| {
+                        let mut hasher = Sha256::new();
+                        hasher.update(m);
+                        format!("{:x}", hasher.finalize()) == write_hash
+                    })
+                    .unwrap_or_else(|| write_hash.is_empty());
+                if !ok {
+                    return Err((
+                        "替换原文件后校验失败（替换原文件阶段），文件内容可能与编辑器不一致，\
+                         请勿继续编辑，可在自动备份中选择恢复"
+                            .to_string(),
+                        Some(reopened),
+                    ));
+                }
+            }
             let meta = FileMeta::from(reopened.as_ref());
-            Ok((meta, reopened))
+            Ok((
+                SaveResult {
+                    meta,
+                    verified: true,
+                    hash: if verify { Some(write_hash) } else { None },
+                    verify_stage: None,
+                },
+                reopened,
+            ))
         }
         Err(e) => Err((format!("已写入但重新打开文件失败: {}", e), None)),
     }
@@ -562,13 +735,16 @@ fn save_file_blocking(
 /// 异步命令 + spawn_blocking，大文件写出不阻塞 IPC。
 /// 保存期间该标签页的映射临时移除（Windows 上被映射的文件无法被 rename 覆盖），
 /// 完成后（含失败恢复）放回映射；写回成功后 piece 表重置为干净基线。
+/// backup_count > 0 时就地保存前滚动备份（0 = 关闭）；verify = 保存后 SHA-256 两阶段校验。
 #[tauri::command]
 async fn save_file(
     tab_id: String,
     changes: Vec<ByteChange>,
     path: Option<String>,
+    backup_count: Option<u32>,
+    verify: Option<bool>,
     state: State<'_, AppState>,
-) -> Result<FileMeta, String> {
+) -> Result<SaveResult, String> {
     let tab = state.remove_tab(&tab_id).ok_or("尚未打开文件")?;
     let orig_path = tab.file.path.clone();
     let opened = tab.file;
@@ -576,6 +752,8 @@ async fn save_file(
     let search_gen = tab.search_gen;
     let analysis_gen = tab.analysis_gen;
     let strings_gen = tab.strings_gen;
+    let backup_count = backup_count.unwrap_or(0).min(10);
+    let verify = verify.unwrap_or(true);
     // 就地保存成功：磁盘已是新内容，piece 表重置为干净基线；
     // 其余情况（另存为 / 任何失败）：磁盘上的当前文件未变，保留原 piece 表（未保存编辑不丢）
     let in_place = path.is_none();
@@ -588,12 +766,12 @@ async fn save_file(
         }
     };
     let handle = tauri::async_runtime::spawn_blocking(move || {
-        save_file_blocking(opened, edits_for_save, changes, path)
+        save_file_blocking(opened, edits_for_save, changes, path, backup_count, verify)
     });
     match handle.await {
-        Ok(Ok((meta, file))) => {
+        Ok(Ok((result, file))) => {
             state.insert_tab(tab_id, rebuild(file, in_place));
-            Ok(meta)
+            Ok(result)
         }
         Ok(Err((msg, Some(file)))) => {
             state.insert_tab(tab_id, rebuild(file, false));
@@ -612,6 +790,130 @@ async fn save_file(
             }
             Err(format!("保存任务失败: {}", e))
         }
+    }
+}
+
+/// 通用文本写盘（对话导出 / 模板导出等），UTF-8 编码
+#[tauri::command]
+fn write_text_file(path: String, content: String) -> Result<(), String> {
+    fs::write(&path, content.as_bytes()).map_err(|e| format!("写入文件失败: {}", e))
+}
+
+/// 备份文件信息（list_backups 返回）
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackupInfo {
+    /// 备份文件名（同目录下）
+    pub name: String,
+    pub size: u64,
+    /// 修改时间（unix 秒）
+    pub modified: u64,
+}
+
+/// 列出某文件当前可用的滚动备份（<file>.bak / .bak.1 / .bak.2 ...）
+#[tauri::command]
+fn list_backups(path: String) -> Result<Vec<BackupInfo>, String> {
+    let p = Path::new(&path);
+    let dir = p.parent().ok_or_else(|| "无法确定文件目录".to_string())?;
+    let name = p
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .ok_or_else(|| "无法确定文件名".to_string())?;
+    let mut out = Vec::new();
+    // 上限 10 份（与设置项一致），顺序为 .bak 最新 → .bak.N 最旧
+    for i in 0u32..10 {
+        let bak = if i == 0 {
+            dir.join(format!("{}.bak", name))
+        } else {
+            dir.join(format!("{}.bak.{}", name, i))
+        };
+        if let Ok(md) = fs::metadata(&bak) {
+            if md.is_file() {
+                out.push(BackupInfo {
+                    name: bak
+                        .file_name()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_default(),
+                    size: md.len(),
+                    modified: unix_secs(md.modified()),
+                });
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// 从备份恢复：把选中的备份复制回原文件路径。
+/// 恢复前先把当前文件按滚动规则再归档一份（防止恢复错版本无法回退）。
+/// 恢复期间释放该标签页的 mmap（Windows 上被映射的文件无法被覆盖写），
+/// 成功后以新内容重新打开。backup_name 必须是该文件自己的 .bak / .bak.N（防路径注入）。
+#[tauri::command]
+async fn restore_backup(
+    tab_id: String,
+    path: String,
+    backup_name: String,
+    backup_count: u32,
+    state: State<'_, AppState>,
+) -> Result<FileMeta, String> {
+    let base = Path::new(&path)
+        .file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .ok_or_else(|| "无法确定文件名".to_string())?;
+    let digits_suffix = backup_name
+        .strip_prefix(&format!("{}.bak", base))
+        .and_then(|s| s.strip_prefix('.'));
+    let valid = backup_name == format!("{}.bak", base)
+        || digits_suffix
+            .map(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+            .unwrap_or(false);
+    if !valid {
+        return Err("非法的备份文件名".into());
+    }
+    let full = Path::new(&path)
+        .parent()
+        .map(|d| d.join(&backup_name))
+        .ok_or_else(|| "无法确定备份路径".to_string())?;
+    if !full.is_file() {
+        return Err("备份文件不存在".into());
+    }
+
+    // 移除标签页并立即释放 mmap（Windows 上被映射的文件无法被覆盖写）；
+    // 仅保留扫描代数供恢复失败时重建句柄
+    let tab = state.remove_tab(&tab_id);
+    let gens = tab
+        .as_ref()
+        .map(|t| (t.search_gen.clone(), t.analysis_gen.clone(), t.strings_gen.clone()));
+    drop(tab);
+    let reinsert = |f: Arc<OpenedFile>| {
+        if let Some((sg, ag, stg)) = &gens {
+            state.insert_tab(
+                tab_id.clone(),
+                TabState::rebuild(f, sg.clone(), ag.clone(), stg.clone()),
+            );
+        }
+    };
+    // 1. 当前内容先归档一份（滚动备份）
+    if let Err(e) = rolling_backup(&path, backup_count.max(1).min(10)) {
+        if let Ok(f) = open_mapped(&path) {
+            reinsert(f);
+        }
+        return Err(format!("恢复前备份当前内容失败: {}", e));
+    }
+    // 2. 备份覆盖原文件
+    if let Err(e) = fs::copy(&full, &path) {
+        if let Ok(f) = open_mapped(&path) {
+            reinsert(f);
+        }
+        return Err(format!("恢复失败: {}", e));
+    }
+    // 3. 重新打开（piece 表重置为干净基线；前端已在此之前丢弃未保存编辑）
+    match open_mapped(&path) {
+        Ok(f) => {
+            let meta = FileMeta::from(f.as_ref());
+            reinsert(f);
+            Ok(meta)
+        }
+        Err(e) => Err(format!("恢复完成但重新打开文件失败: {}", e)),
     }
 }
 
@@ -1443,6 +1745,9 @@ pub fn run() {
             delete_range,
             get_virtual_size,
             save_file,
+            write_text_file,
+            list_backups,
+            restore_backup,
             search,
             cancel_search,
             analyze_file,

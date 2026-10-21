@@ -144,6 +144,32 @@ export function SidebarBookmarks({
 }: SidebarBookmarksProps) {
   const digits = meta ? offsetDigits(meta.size) : 8;
   const hasFile = !!meta && meta.size > 0;
+  // 模板字段独立分组展示（与用户书签/标记区分）；普通条目保持按偏移混排
+  const fields = bookmarks.filter(b => b.kind === 'field');
+  const normal = bookmarks.filter(b => b.kind !== 'field');
+
+  const renderList = (items: Bookmark[], offset: number) => (
+    <ul className="bm-list">
+      {items.slice(0, Math.max(0, maxBookmarkItems - offset)).map(bm => (
+        <BookmarkItem
+          key={bm.id}
+          bm={bm}
+          active={bm.id === activeBookmarkId}
+          invalid={bm.start >= (meta?.size ?? 0)}
+          digits={digits}
+          readOnly={readOnly}
+          onUpdate={onUpdateBookmark}
+          onRemove={onRemoveBookmark}
+          onJump={() => onJumpToBookmark(bm)}
+        />
+      ))}
+      {items.length + offset > maxBookmarkItems && (
+        <li className="bm-more">
+          仅显示前 {maxBookmarkItems} 条，共 {formatNumber(bookmarks.length)} 条
+        </li>
+      )}
+    </ul>
+  );
 
   return (
     <section className="side-section">
@@ -190,26 +216,26 @@ export function SidebarBookmarks({
           选中区间后按 Ctrl+Shift+B 添加标记
         </p>
       ) : (
-        <ul className="bm-list">
-          {bookmarks.slice(0, maxBookmarkItems).map(bm => (
-            <BookmarkItem
-              key={bm.id}
-              bm={bm}
-              active={bm.id === activeBookmarkId}
-              invalid={bm.start >= (meta?.size ?? 0)}
-              digits={digits}
-              readOnly={readOnly}
-              onUpdate={onUpdateBookmark}
-              onRemove={onRemoveBookmark}
-              onJump={() => onJumpToBookmark(bm)}
-            />
-          ))}
-          {bookmarks.length > maxBookmarkItems && (
-            <li className="bm-more">
-              仅显示前 {maxBookmarkItems} 条，共 {formatNumber(bookmarks.length)} 条
-            </li>
+        <>
+          {fields.length > 0 && (
+            <>
+              <div className="bm-group-title">
+                模板字段 <span className="bm-group-count">{formatNumber(fields.length)}</span>
+              </div>
+              {renderList(fields, 0)}
+            </>
           )}
-        </ul>
+          {normal.length > 0 && (
+            <>
+              {fields.length > 0 && (
+                <div className="bm-group-title">
+                  书签与标记 <span className="bm-group-count">{formatNumber(normal.length)}</span>
+                </div>
+              )}
+              {renderList(normal, fields.length)}
+            </>
+          )}
+        </>
       )}
     </section>
   );

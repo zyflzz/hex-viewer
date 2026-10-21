@@ -509,8 +509,10 @@ function ChecksumSection({
   const [detail, setDetail] = useState<{ name: string; value: string } | null>(null);
   const cacheRef = useRef(new Map<string, Checksums>());
 
-  const selStart = selection?.start ?? -1;
-  const selEnd = selection?.end ?? -1;
+  // 块选择（矩形）没有单一连续区间，语义不明确：校验和退回为"无选择"（提示改用线性选择）
+  const isBlock = selection !== null && 'mode' in selection;
+  const selStart = isBlock ? -1 : (selection?.start ?? -1);
+  const selEnd = isBlock ? -1 : (selection?.end ?? -1);
 
   // meta 引用仅在打开 / 保存（重新 mmap）时变化 → 磁盘内容已变，缓存失效；
   // 普通滚动触发的分片缓存版本号 bump 不会传到这里，避免误清
@@ -521,6 +523,12 @@ function ChecksumSection({
   // 选中区间变化 → 200ms 防抖重算；同区间命中缓存
   useEffect(() => {
     if (!meta || !selection) {
+      setResult(null);
+      setError(null);
+      return;
+    }
+    if (selStart < 0 || selEnd < selStart) {
+      // 块选择等无单一连续区间的形态：不计算（提示见下方空态文案）
       setResult(null);
       setError(null);
       return;

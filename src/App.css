@@ -2826,3 +2826,266 @@ body {
   border: 1px solid var(--border);
   border-radius: 4px;
 }
+
+/* ============ v1.1.5 体验补全与数据安全加固 ============ */
+
+/* ---- 模板字段边界分隔线（box-shadow 实现，不影响字节列布局） ---- */
+.bs.fsep-l {
+  box-shadow: inset 1.5px 0 0 var(--mark-solid, var(--text));
+}
+
+.bs.fsep-r {
+  box-shadow: inset -1.5px 0 0 var(--mark-solid, var(--text));
+}
+
+/* ---- 备份恢复对话框 ---- */
+.bak-dialog .modal-body {
+  min-width: 380px;
+}
+
+.bak-list {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  max-height: 320px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.bak-item {
+  width: 100%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--text);
+  cursor: pointer;
+  text-align: left;
+  font-size: 12px;
+}
+
+.bak-item:hover {
+  border-color: var(--accent);
+  background: var(--hover-bg);
+}
+
+.bak-tag {
+  flex: none;
+  font-size: 10.5px;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  color: var(--dim);
+}
+
+.bak-tag.newest {
+  color: var(--accent-fg);
+  background: var(--accent);
+  border-color: var(--accent);
+}
+
+.bak-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bak-meta {
+  flex: none;
+  color: var(--dim);
+  font-size: 11px;
+}
+
+/* ---- 书签列表分组标题（模板字段 / 书签与标记） ---- */
+.bm-group-title {
+  margin: 10px 0 4px;
+  padding: 0 4px;
+  font-size: 11.5px;
+  font-weight: 600;
+  color: var(--dim);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.side-section h3 + .bm-group-title,
+.bm-actions + .bm-group-title {
+  margin-top: 8px;
+}
+
+.bm-group-count {
+  font-weight: 400;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ---- AI 生成模板对话框 ---- */
+.tpl-dialog {
+  width: min(760px, 94vw);
+}
+
+.tpl-dialog .modal-body {
+  max-height: min(64vh, 560px);
+  overflow-y: auto;
+}
+
+.tpl-body {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.tpl-input-meta {
+  font-size: 11.5px;
+  color: var(--dim);
+}
+
+.tpl-desc {
+  resize: vertical;
+  font-size: 12.5px;
+  line-height: 1.6;
+}
+
+.tpl-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tpl-load {
+  max-width: 220px;
+}
+
+.tpl-flex {
+  flex: 1;
+}
+
+.tpl-raw {
+  margin: 0;
+  padding: 8px 10px;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  font-size: 11.5px;
+  line-height: 1.6;
+  max-height: 180px;
+  overflow-y: auto;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.tpl-error {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.tpl-manual {
+  resize: vertical;
+  font-size: 11.5px;
+  line-height: 1.5;
+}
+
+.tpl-name-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.tpl-name-row .input {
+  max-width: 260px;
+}
+
+.tpl-table {
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  overflow: hidden;
+  font-size: 12px;
+}
+
+.tpl-tr {
+  display: grid;
+  grid-template-columns: 36px minmax(96px, 1.2fr) 84px 56px 92px minmax(90px, 1.4fr) 108px;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 8px;
+  border-bottom: 1px solid var(--border);
+  min-width: 0;
+}
+
+.tpl-tr:last-child {
+  border-bottom: none;
+}
+
+.tpl-tr.off {
+  opacity: 0.45;
+}
+
+.tpl-th {
+  background: var(--panel2);
+  color: var(--dim);
+  font-size: 11px;
+  position: sticky;
+  top: 0;
+}
+
+.tpl-cell {
+  padding: 2px 6px;
+  font-size: 11.5px;
+  min-width: 0;
+  width: 100%;
+}
+
+.tpl-len {
+  width: 52px;
+}
+
+.tpl-preview {
+  color: var(--dim);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.tpl-palette {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.tpl-swatch {
+  width: 13px;
+  height: 13px;
+  border-radius: 3px;
+  border: 1px solid var(--border);
+  padding: 0;
+  cursor: pointer;
+}
+
+.tpl-swatch.on {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* ---- 导出对话框的复选框行 ---- */
+.chk-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text);
+  cursor: pointer;
+  user-select: none;
+}
+
+.chk-label input[type='checkbox'] {
+  accent-color: var(--accent);
+}

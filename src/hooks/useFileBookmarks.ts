@@ -114,6 +114,28 @@ export function useFileBookmarks(fileMeta: FileMeta | null) {
     ]);
   }, []);
 
+  /**
+   * 批量写入模板字段标记（v1.1.5）：替换现有 kind='field' 条目（避免重复应用叠加），
+   * 保留用户手动添加的书签与标记。
+   */
+  const addFields = useCallback(
+    (fields: Array<{ name: string; start: number; end: number; color: string }>) => {
+      setBookmarks(prev => [
+        ...prev.filter(b => b.kind !== 'field'),
+        ...fields.map(f => ({
+          id: newId(),
+          start: f.start,
+          end: f.end,
+          name: f.name,
+          color: f.color,
+          createdAt: Date.now(),
+          kind: 'field' as const,
+        })),
+      ]);
+    },
+    [],
+  );
+
   const removeBookmark = useCallback((id: string) => {
     setBookmarks(prev => prev.filter(b => b.id !== id));
   }, []);
@@ -156,6 +178,7 @@ export function useFileBookmarks(fileMeta: FileMeta | null) {
     maxRenderItems: MAX_RENDER_ITEMS,
     toggleBookmarkAt,
     addMark,
+    addFields,
     removeBookmark,
     updateBookmark,
     clearAll,

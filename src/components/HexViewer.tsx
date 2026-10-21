@@ -10,6 +10,16 @@ import React, {
 import { useVirtualizer } from '@tanstack/react-virtual';
 import type { Bookmark, DisplayConfig, EditMode, FileMeta, Selection, TextEncoding } from '../types';
 import { decodeRow } from '../utils/decode';
+import {
+  blockCorners,
+  blockFromCells,
+  blockRowRange,
+  cellToOffset,
+  farthestCorner,
+  isBlockSelection,
+  linearToBlock,
+  offsetToCell,
+} from '../utils/selection';
 import { byteClass, byteToAscii, hexByte, hexOffset, offsetDigits } from '../utils/format';
 
 export interface HexViewerHandle {
@@ -210,17 +220,23 @@ const Row = React.memo(function Row({
   );
 
   // 本行相关的书签/标记：偏移列圆点颜色（行内首个书签）+ 裁剪到行的标记区间
+  // 区间元组：[start, end, color, isField]（模板字段带边界分隔线）
   const rowMarks = useMemo(() => {
     if (!bookmarks.length) return null;
     const rowEnd = rowStart + rowBytes - 1;
     let dot: string | null = null;
-    const ranges: Array<[number, number, string]> = [];
+    const ranges: Array<[number, number, string, boolean]> = [];
     for (const bm of bookmarks) {
       if (bm.end < rowStart || bm.start > rowEnd) continue;
       if (bm.start === bm.end) {
         if (dot === null) dot = bm.color;
       } else {
-        ranges.push([Math.max(bm.start, rowStart), Math.min(bm.end, rowEnd), bm.color]);
+        ranges.push([
+          Math.max(bm.start, rowStart),
+          Math.min(bm.end, rowEnd),
+          bm.color,
+          bm.kind === 'field',
+        ]);
       }
     }
     return dot !== null || ranges.length ? { dot, ranges } : null;
@@ -245,9 +261,19 @@ const Row = React.memo(function Row({
     // 落在本字节的标记区间（行内通常 0–2 个，线性查找即可）
     const markRange = rowMarks?.ranges.find(([s, e]) => off >= s && off <= e);
     const markStyle = (
-      markRange ? { '--mark': `${markRange[2]}2e` } : null
+      markRange
+        ? {
+            '--mark': `${markRange[2]}2e`,
+            ...(markRange[3] ? { '--mark-solid': markRange[2] } : null),
+          }
+        : null
     ) as React.CSSProperties | null;
     const markCls = markRange ? ' mark' : '';
+    // 模板字段边界：区间起点加左分隔线、终点加右分隔线（box-shadow 实现，不影响布局）
+    const fieldSepCls =
+      markRange && markRange[3]
+        ? `${off === markRange[0] ? ' fsep-l' : ''}${off === markRange[1] ? ' fsep-r' : ''}`
+        : '';
     const editCls = isEdited ? ' edited' : '';
     const isHit = hitSet !== null && hitSet.has(off);
     const hitCls = off === activeHit ? ' hit-active' : isHit ? ' hit' : '';
@@ -260,7 +286,7 @@ const Row = React.memo(function Row({
     }
     if (b === null) {
       // 分片尚未到达
-      const cls = `bs m${inSel ? ' s' : ''}${isHover ? ' v' : ''}${isCursor ? ' cur' : ''}${markCls}${editCls}${hitCls}${colCls}`;
+      const cls = `bs m${inSel ? ' s' : ''}${isHover ? ' v' : ''}${isCursor ? ' cur' : ''}${markCls}${fieldSepCls}${editCls}${hitCls}${colCls}`;
       hexCells.push(
         <span key={i} data-o={off} className={cls} style={markStyle ?? undefined}>
           {'--' + groupGap}
@@ -292,7 +318,7 @@ const Row = React.memo(function Row({
         <span
           key={i}
           data-o={off}
-          className={`${inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`}${isCursor ? ' cur' : ''}${markCls}${editCls}${hitCls}${colCls}`}
+          className={`${inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`}${isCursor ? ' cur' : ''}${markCls}${fieldSepCls}${editCls}${hitCls}${colCls}`}
           style={markStyle ?? undefined}
         >
           {hexByte(b) + groupGap}
@@ -311,7 +337,7 @@ const Row = React.memo(function Row({
         <span
           key={i}
           data-o={off}
-          className={(inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`) + stateCls + (isCursor ? ' cur' : '') + markCls + editCls + hitCls + colCls}
+          className={(inSel ? 'bs s' : isHover ? 'bs v' : `bs ${byteClass(b)}`) + stateCls + (isCursor ? ' cur' : '') + markCls + fieldSepCls + editCls + hitCls + colCls}
           style={markStyle ?? undefined}
         >
           {cell.char}
@@ -407,7 +433,13 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
 ) {
   const parentRef = useRef<HTMLDivElement>(null);
   const draggingRef = useRef(false);
+  /** 块选择拖拽中（Alt+拖拽） */
+  const blockDragRef = useRef(false);
   const dragAnchorRef = useRef(0);
+  /** 块选择拖拽 / Shift+Alt+点击扩展的锚点单元格 */
+  const blockAnchorRef = useRef<{ row: number; col: number } | null>(null);
+  /** Alt+方向键扩展块选择的锚点（首次按下时以光标所在行列锚定） */
+  const altAnchorRef = useRef<{ row: number; col: number } | null>(null);
   /** Shift 扩展选择的锚点（首次 Shift 导航前的光标位置） */
   const shiftAnchorRef = useRef<number | null>(null);
 
@@ -497,20 +529,51 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
   /** 键盘导航：移动光标；Shift 扩展选择，非 Shift 折叠选择到光标 */
   const handleKeyDown = useCallback(
     (e: React.KeyboardEvent) => {
-      // Alt+←/→：光标历史后退/前进（容器聚焦时才触发本处理器，输入框不受影响）
-      if (e.altKey && (e.key === 'ArrowLeft' || e.key === 'ArrowRight')) {
-        if (!onHistoryNav) return;
-        e.preventDefault();
-        onHistoryNav(e.key === 'ArrowLeft' ? -1 : 1);
-        return;
+      const arrow = e.key.startsWith('Arrow') ? e.key : null;
+      if (e.altKey && arrow) {
+        // 已有选择（线性或块）时 Alt+方向键：切换/扩展块选择（以光标所在行列锚定）
+        if (selection && cursorOffset !== null) {
+          e.preventDefault();
+          const cursorCell = offsetToCell(cursorOffset, rowBytes);
+          const block = isBlockSelection(selection) ? selection : linearToBlock(selection, rowBytes);
+          if (!altAnchorRef.current) {
+            // 首次按下：锚点 = 块角中离光标最近的角（线性选择转块时即光标一端）
+            altAnchorRef.current = blockCorners(block).reduce((best, c) => {
+              const d = (x: { row: number; col: number }) =>
+                Math.abs(x.row - cursorCell.row) + Math.abs(x.col - cursorCell.col);
+              return d(c) < d(best) ? c : best;
+            });
+          }
+          const anchor = altAnchorRef.current ?? cursorCell;
+          // 活动端点 = 离锚点最远的角，沿方向扩展一格
+          const far = farthestCorner(block, anchor);
+          const maxRow = totalRows - 1;
+          const cell = {
+            row: Math.max(0, Math.min(far.row + (arrow === 'ArrowUp' ? -1 : arrow === 'ArrowDown' ? 1 : 0), maxRow)),
+            col: Math.max(0, Math.min(far.col + (arrow === 'ArrowLeft' ? -1 : arrow === 'ArrowRight' ? 1 : 0), rowBytes - 1)),
+          };
+          onSelectionChange(blockFromCells(anchor, cell));
+          // 光标跟随扩展端点（钳制到文件末尾）
+          onCursorChange(Math.min(cellToOffset(cell, rowBytes), meta.size - 1));
+        } else if (arrow === 'ArrowLeft' || arrow === 'ArrowRight') {
+          // 无选择：Alt+←/→ 光标历史后退/前进（容器聚焦时才触发，输入框不受影响）
+          if (!onHistoryNav) return;
+          e.preventDefault();
+          onHistoryNav(arrow === 'ArrowLeft' ? -1 : 1);
+        }
+        // 无选择时 Alt+↑/↓ 落到下方普通光标移动
+        if (selection) return;
+        if (arrow === 'ArrowLeft' || arrow === 'ArrowRight') return;
       }
       if (cursorOffset === null || totalRows === 0) return;
       const max = meta.size - 1;
       const cur = cursorOffset;
 
       if (e.key === 'Escape') {
-        // 选择清空由 App 全局快捷键处理，这里只重置 Shift 锚点
+        // 选择清空由 App 全局快捷键处理，这里只重置扩展锚点
         shiftAnchorRef.current = null;
+        altAnchorRef.current = null;
+        blockAnchorRef.current = null;
         return;
       }
 
@@ -560,7 +623,17 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
       }
       onCursorChange(target);
     },
-    [cursorOffset, totalRows, meta.size, rowBytes, rowHeight, onSelectionChange, onCursorChange, onHistoryNav],
+    [
+      selection,
+      cursorOffset,
+      totalRows,
+      meta.size,
+      rowBytes,
+      rowHeight,
+      onSelectionChange,
+      onCursorChange,
+      onHistoryNav,
+    ],
   );
 
   const offsetFromEvent = useCallback((e: React.MouseEvent): number | null => {
@@ -589,6 +662,23 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
       // preventDefault 会阻止默认聚焦，手动聚焦容器以启用键盘导航
       parentRef.current?.focus({ preventScroll: true });
       shiftAnchorRef.current = null;
+      altAnchorRef.current = null;
+      if (e.altKey) {
+        // 块选择：Alt+点击新建；Shift+Alt+点击在现有块上扩展（锚点取离点击点最远的角）
+        const cell = offsetToCell(off, rowBytes);
+        const anchor =
+          e.shiftKey && selection
+            ? blockAnchorRef.current ??
+              farthestCorner(isBlockSelection(selection) ? selection : linearToBlock(selection, rowBytes), cell)
+            : cell;
+        blockAnchorRef.current = anchor;
+        blockDragRef.current = true;
+        draggingRef.current = true;
+        onSelectionChange(blockFromCells(anchor, cell));
+        onCursorChange(off);
+        return;
+      }
+      blockDragRef.current = false;
       if (selectionAnchor !== null) {
         // "从此处开始选择"待定锚点：本次点击确定终点并消费锚点
         dragAnchorRef.current = selectionAnchor;
@@ -601,8 +691,8 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
         draggingRef.current = true;
         return;
       }
-      if (e.shiftKey && selection) {
-        // Shift 点击：以现有选择另一端为锚点扩展
+      if (e.shiftKey && selection && !isBlockSelection(selection)) {
+        // Shift 点击：以现有线性选择另一端为锚点扩展
         const anchor = Math.abs(off - selection.start) > Math.abs(off - selection.end)
           ? selection.start
           : selection.end;
@@ -619,6 +709,7 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
       offsetFromEvent,
       selection,
       selectionAnchor,
+      rowBytes,
       onSelectionAnchorChange,
       onSelectionChange,
       onCursorChange,
@@ -651,18 +742,24 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
       const off = offsetFromEvent(e);
       onHoverOffsetChange(off);
       if (draggingRef.current && off !== null) {
-        const anchor = dragAnchorRef.current;
-        onSelectionChange({ start: Math.min(anchor, off), end: Math.max(anchor, off) });
+        if (blockDragRef.current && blockAnchorRef.current) {
+          // 块选择拖拽：锚点单元格与当前行列之间构造矩形
+          onSelectionChange(blockFromCells(blockAnchorRef.current, offsetToCell(off, rowBytes)));
+        } else {
+          const anchor = dragAnchorRef.current;
+          onSelectionChange({ start: Math.min(anchor, off), end: Math.max(anchor, off) });
+        }
         // 光标跟随拖拽终点（选择区间的活动端点）
         onCursorChange(off);
       }
     },
-    [offsetFromEvent, onHoverOffsetChange, onSelectionChange, onCursorChange],
+    [offsetFromEvent, onHoverOffsetChange, onSelectionChange, onCursorChange, rowBytes],
   );
 
   useEffect(() => {
     const up = () => {
       draggingRef.current = false;
+      blockDragRef.current = false;
     };
     window.addEventListener('mouseup', up);
     return () => window.removeEventListener('mouseup', up);
@@ -672,12 +769,16 @@ export const HexViewer = forwardRef<HexViewerHandle, HexViewerProps>(function He
   const rowSelRange = useCallback(
     (rowIndex: number): [number, number] | null => {
       if (!selection) return null;
+      // 块选择：列范围按行裁剪（渲染层不感知块选择，仍然只拿连续区间）
+      if (isBlockSelection(selection)) {
+        return blockRowRange(selection, rowIndex, rowBytes, meta.size);
+      }
       const rs = rowIndex * rowBytes;
       const re = rs + rowBytes - 1;
       if (selection.end < rs || selection.start > re) return null;
       return [Math.max(selection.start, rs), Math.min(selection.end, re)];
     },
-    [selection, rowBytes],
+    [selection, rowBytes, meta.size],
   );
 
   /** 命中偏移按行分组（引用随 hitOffsets 稳定，保证 Row memo 命中） */

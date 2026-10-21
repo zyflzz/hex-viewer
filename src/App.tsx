@@ -36,6 +36,9 @@ function App() {
     setByteGrouping,
     setRowHighlight,
     setColHighlight,
+    setBackupEnabled,
+    setBackupCount,
+    setVerifySave,
   } = useDisplayConfig();
   const ai = useAiConfig();
   const { recentFiles, addRecent, removeRecent, clearRecent } = useRecentFiles();
@@ -604,6 +607,9 @@ function App() {
               onEditModeChange={setEditMode}
               onConfirmSaveChange={setConfirmSave}
               onVersionModeChange={setVersionMode}
+              onBackupEnabledChange={setBackupEnabled}
+              onBackupCountChange={setBackupCount}
+              onVerifySaveChange={setVerifySave}
               aiConfig={ai.config}
               onAiConfigChange={ai.updateConfig}
               onAiResetSystemPrompt={ai.resetSystemPrompt}

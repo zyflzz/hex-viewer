@@ -38,6 +38,15 @@ interface SidebarProps {
   onEditModeChange: (m: EditMode) => void;
   confirmSave: boolean;
   onConfirmSaveChange: (v: boolean) => void;
+  /** 数据安全（v1.1.5）：自动备份 / 保存后校验 */
+  backupEnabled: boolean;
+  onBackupEnabledChange: (v: boolean) => void;
+  backupCount: number;
+  onBackupCountChange: (n: 1 | 2 | 3 | 5 | 10) => void;
+  verifySave: boolean;
+  onVerifySaveChange: (v: boolean) => void;
+  /** 打开"从备份恢复"对话框 */
+  onRestoreBackup: () => void;
   editCount: number;
   canUndo: boolean;
   canRedo: boolean;
@@ -109,6 +118,13 @@ export function Sidebar(props: SidebarProps) {
     onEditModeChange,
     confirmSave,
     onConfirmSaveChange,
+    backupEnabled,
+    onBackupEnabledChange,
+    backupCount,
+    onBackupCountChange,
+    verifySave,
+    onVerifySaveChange,
+    onRestoreBackup,
     editCount,
     canUndo,
     canRedo,
@@ -254,6 +270,13 @@ export function Sidebar(props: SidebarProps) {
             onEditModeChange={onEditModeChange}
             confirmSave={confirmSave}
             onConfirmSaveChange={onConfirmSaveChange}
+            backupEnabled={backupEnabled}
+            onBackupEnabledChange={onBackupEnabledChange}
+            backupCount={backupCount}
+            onBackupCountChange={onBackupCountChange}
+            verifySave={verifySave}
+            onVerifySaveChange={onVerifySaveChange}
+            onRestoreBackup={onRestoreBackup}
             editCount={editCount}
             canUndo={canUndo}
             canRedo={canRedo}

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import type { FileMeta, Selection, TextEncoding } from '../types';
 import { formatBytes, hexOffset, offsetDigits } from '../utils/format';
+import { describeSelection, isBlockSelection, normalizeSelection } from '../utils/selection';
 import { ENCODING_OPTIONS, encodingLabel } from '../utils/decode';
 
 interface StatusBarProps {
@@ -68,7 +69,10 @@ export function StatusBar({
   }, [showCopyMenu, closeMenu]);
 
   const digits = meta ? offsetDigits(meta.size) : 8;
-  const selCount = selection ? selection.end - selection.start + 1 : 0;
+  // 块选择：显示 "块选择 R1:C1 – R2:C2" + 总字节数；线性选择显示偏移区间
+  const selCount = meta
+    ? normalizeSelection(selection, rowBytes, meta.size).totalBytes
+    : 0;
 
   return (
     <footer className="statusbar">
@@ -82,9 +86,11 @@ export function StatusBar({
         <span className="status-item">
           选择{' '}
           <span className="mono">
-            {hexOffset(selection.start, digits)}–{hexOffset(selection.end, digits)}
+            {isBlockSelection(selection)
+              ? describeSelection(selection)
+              : `${hexOffset(selection.start, digits)}–${hexOffset(selection.end, digits)}`}
+            （{selCount} B）
           </span>{' '}
-          ({selCount} B)
           <button className="btn mini" onClick={onCopyHex} title="复制选中字节的十六进制">
             复制 Hex
           </button>

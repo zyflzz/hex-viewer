@@ -7,6 +7,10 @@ interface FillDialogProps {
   end: number;
   /** 偏移显示位数（与主视图一致） */
   digits: number;
+  /** 块选择等非连续区间：展示标签（替代起止偏移），len 由 totalBytes 提供 */
+  label?: string;
+  /** 块选择的总字节数（不传 = end - start + 1） */
+  totalBytes?: number;
   onCommit: (value: number) => void;
   onCancel: () => void;
 }
@@ -19,7 +23,7 @@ const PRESETS = [
 ] as const;
 
 /** 填充对话框：把选中区间全部写为同一字节值（两位 Hex） */
-export function FillDialog({ start, end, digits, onCommit, onCancel }: FillDialogProps) {
+export function FillDialog({ start, end, digits, label, totalBytes, onCommit, onCancel }: FillDialogProps) {
   const [text, setText] = useState('00');
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -39,7 +43,7 @@ export function FillDialog({ start, end, digits, onCommit, onCancel }: FillDialo
 
   const clean = text.replace(/[^0-9a-fA-F]/g, '').toUpperCase();
   const valid = clean.length === 2;
-  const len = end - start + 1;
+  const len = totalBytes ?? end - start + 1;
 
   const commit = () => {
     if (!valid) return;
@@ -54,7 +58,11 @@ export function FillDialog({ start, end, digits, onCommit, onCancel }: FillDialo
           <div className="edit-row">
             <span className="edit-label">区间</span>
             <span className="mono">
-              {hexOffset(start, digits)} – {hexOffset(end, digits)}（{len} 字节）
+              {label ?? (
+                <>
+                  {hexOffset(start, digits)} – {hexOffset(end, digits)}（{len} 字节）
+                </>
+              )}
             </span>
           </div>
           <div className="edit-row column">

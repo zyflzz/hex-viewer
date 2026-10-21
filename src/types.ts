@@ -123,6 +123,12 @@ export interface DisplayConfig {
   rowHighlight: boolean;
   /** 光标所在列高亮 */
   colHighlight: boolean;
+  /** 保存前自动备份原文件（v1.1.5） */
+  backupEnabled: boolean;
+  /** 自动备份保留份数（0 表示跟随 backupEnabled；1–10） */
+  backupCount: 1 | 2 | 3 | 5 | 10;
+  /** 保存后 SHA-256 校验（v1.1.5） */
+  verifySave: boolean;
 }
 
 /** 标签页对外上报的状态（App 汇总用于工具栏 / 标签栏展示） */
@@ -153,11 +159,25 @@ export interface DiffTabInfo {
 
 export type AnyTabInfo = TabInfo | DiffTabInfo;
 
-/** 字节级选择（含首尾） */
-export interface Selection {
+/**
+ * 字节级选择（可辨别联合，v1.1.5）：
+ * - 线性选择（默认形态）：{ start, end } 含首尾的连续区间，全部既有逻辑保持不变
+ * - 块选择（矩形）：第 startRow..endRow 行的第 startCol..endCol 列（列索引相对行首，0 基）
+ */
+export interface LinearSelection {
   start: number;
   end: number;
 }
+
+export interface BlockSelection {
+  mode: 'block';
+  startRow: number;
+  endRow: number;
+  startCol: number;
+  endCol: number;
+}
+
+export type Selection = LinearSelection | BlockSelection;
 
 /** 书签（点，start === end）或标记（区间，start < end），按文件路径持久化 */
 export interface Bookmark {
@@ -171,6 +191,63 @@ export interface Bookmark {
   /** 预设调色板颜色（#rrggbb） */
   color: string;
   createdAt: number;
+  /** 条目类别（v1.1.5）：点书签 / 区间标记 / 模板字段；缺省视为 mark（兼容旧数据） */
+  kind?: 'bookmark' | 'mark' | 'field';
+}
+
+// ============ AI 生成模板（v1.1.5） ============
+
+/** 模板字段类型（AI 输出枚举，解析时白名单校验） */
+export type TemplateFieldType =
+  | 'uint8'
+  | 'uint16'
+  | 'uint32'
+  | 'uint64'
+  | 'int8'
+  | 'int16'
+  | 'int32'
+  | 'int64'
+  | 'float'
+  | 'double'
+  | 'string'
+  | 'timestamp'
+  | 'color'
+  | 'bytes';
+
+/** 模板字段：offset 相对模板输入起始位置的字节偏移 */
+export interface TemplateField {
+  name: string;
+  offset: number;
+  length: number;
+  type: TemplateFieldType;
+  description?: string;
+}
+
+/** 按文件路径持久化的结构模板 */
+export interface FileTemplate {
+  id: string;
+  name: string;
+  createdAt: number;
+  fields: TemplateField[];
+}
+
+// ============ 保存链路加固（v1.1.5） ============
+
+/** 保存结果：meta + 校验结论（verified = 已执行的校验全部通过） */
+export interface SaveResult {
+  meta: FileMeta;
+  verified: boolean;
+  /** 写入时同步累计的 SHA-256（关闭校验时为 null） */
+  hash: string | null;
+  /** 校验失败阶段（"写入临时文件" / "替换原文件"），成功为 null */
+  verify_stage: string | null;
+}
+
+/** 备份文件信息（list_backups 返回，serde camelCase） */
+export interface BackupInfo {
+  name: string;
+  size: number;
+  modified: number; // unix 秒
 }
 
 // ============ 可变长度编辑（v1.1.4） ============

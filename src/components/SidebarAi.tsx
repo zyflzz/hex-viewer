@@ -138,6 +138,10 @@ export interface SidebarAiProps {
   onStop: () => void;
   /** 请求清空会话（App 层弹确认） */
   onClearRequest: () => void;
+  /** 导出当前会话（v1.1.5，App 层弹导出对话框） */
+  onExport: () => void;
+  /** AI 生成模板（v1.1.5，App 层组装输入并弹模板对话框） */
+  onGenerateTemplate: () => void;
   /** 偏移位数（按文件大小自适应） */
   digits: number;
 }
@@ -158,6 +162,8 @@ export function SidebarAi(props: SidebarAiProps) {
     onSend,
     onStop,
     onClearRequest,
+    onExport,
+    onGenerateTemplate,
     digits,
   } = props;
 
@@ -446,6 +452,16 @@ export function SidebarAi(props: SidebarAiProps) {
 
       <div className="ai-session">
         <span className="ai-session-count">{chatCount > 0 ? `${chatCount} 条消息` : '空会话'}</span>
+        <button
+          className="btn mini"
+          title="用 AI 把选中/光标附近的数据解析为结构模板（字段标注）"
+          onClick={onGenerateTemplate}
+        >
+          生成模板
+        </button>
+        <button className="btn mini" disabled={!messages.length} title="导出会话为 Markdown / JSON 文件" onClick={onExport}>
+          导出
+        </button>
         <button className="btn mini" disabled={!messages.length} onClick={onClearRequest}>
           清空当前会话
         </button>

@@ -10,6 +10,17 @@ interface SidebarEditProps {
   onEditModeChange: (m: EditMode) => void;
   confirmSave: boolean;
   onConfirmSaveChange: (v: boolean) => void;
+  /** 保存前自动备份原文件（v1.1.5） */
+  backupEnabled: boolean;
+  onBackupEnabledChange: (v: boolean) => void;
+  /** 备份保留份数 */
+  backupCount: number;
+  onBackupCountChange: (n: 1 | 2 | 3 | 5 | 10) => void;
+  /** 保存后 SHA-256 校验 */
+  verifySave: boolean;
+  onVerifySaveChange: (v: boolean) => void;
+  /** 打开"从备份恢复"对话框 */
+  onRestoreBackup: () => void;
   editCount: number;
   canUndo: boolean;
   canRedo: boolean;
@@ -57,13 +68,20 @@ function fmtTime(t: number): string {
     : `${d.getMonth() + 1}/${d.getDate()} ${time}`;
 }
 
-/** "编辑"选项卡：编辑模式 / 保存确认 / 撤销恢复 / 操作记录 */
+/** "编辑"选项卡：编辑模式 / 保存确认 / 数据安全（备份+校验） / 撤销恢复 / 操作记录 */
 export function SidebarEdit({
   meta,
   editMode,
   onEditModeChange,
   confirmSave,
   onConfirmSaveChange,
+  backupEnabled,
+  onBackupEnabledChange,
+  backupCount,
+  onBackupCountChange,
+  verifySave,
+  onVerifySaveChange,
+  onRestoreBackup,
   editCount,
   canUndo,
   canRedo,
@@ -132,6 +150,58 @@ export function SidebarEdit({
               <span className="toggle-knob" />
             </button>
           </div>
+          <div className="edit-opt">
+            <span className="edit-label">自动备份</span>
+            <button
+              className={`toggle${backupEnabled ? ' on' : ''}`}
+              role="switch"
+              aria-checked={backupEnabled}
+              title="就地保存前自动把磁盘原文件滚动备份一份（防覆盖丢失）"
+              onClick={() => onBackupEnabledChange(!backupEnabled)}
+            >
+              <span className="toggle-knob" />
+            </button>
+          </div>
+          {backupEnabled && (
+            <div className="edit-opt">
+              <span className="edit-label">保留份数</span>
+              <select
+                className="select"
+                value={backupCount}
+                onChange={e => onBackupCountChange(Number(e.target.value) as 1 | 2 | 3 | 5 | 10)}
+                title="同名 .bak / .bak.1 / .bak.2 … 滚动保留的份数"
+              >
+                {[1, 2, 3, 5, 10].map(n => (
+                  <option key={n} value={n}>
+                    {n} 份
+                  </option>
+                ))}
+              </select>
+            </div>
+          )}
+          <div className="edit-opt">
+            <span className="edit-label">保存后校验</span>
+            <button
+              className={`toggle${verifySave ? ' on' : ''}`}
+              role="switch"
+              aria-checked={verifySave}
+              title="保存后对磁盘文件做 SHA-256 比对（大文件 >500MB 自动跳过第二层校验）"
+              onClick={() => onVerifySaveChange(!verifySave)}
+            >
+              <span className="toggle-knob" />
+            </button>
+          </div>
+          {meta && (
+            <div className="edit-opt">
+              <span className="edit-label">备份恢复</span>
+              <button className="btn mini" onClick={onRestoreBackup} title="从 .bak 备份覆盖当前文件">
+                从备份恢复…
+              </button>
+            </div>
+          )}
+          {meta && meta.size > 500 * 1024 * 1024 && (
+            <p className="edit-tip">当前文件较大，自动备份与保存后校验会占用较多磁盘读取时间，可在上方按需关闭</p>
+          )}
           <div className="edit-opt">
             <span className="edit-label">未保存修改</span>
             <span className={`edit-count${editCount > 0 ? ' has' : ''}`}>

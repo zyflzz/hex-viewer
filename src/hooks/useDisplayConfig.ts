@@ -23,6 +23,9 @@ const DEFAULT_CONFIG: DisplayConfig = {
   byteGrouping: 4,
   rowHighlight: true,
   colHighlight: true,
+  backupEnabled: true,
+  backupCount: 3,
+  verifySave: true,
 };
 
 function loadConfig(): DisplayConfig {
@@ -62,6 +65,17 @@ function loadConfig(): DisplayConfig {
         typeof parsed.rowHighlight === 'boolean' ? parsed.rowHighlight : DEFAULT_CONFIG.rowHighlight,
       colHighlight:
         typeof parsed.colHighlight === 'boolean' ? parsed.colHighlight : DEFAULT_CONFIG.colHighlight,
+      backupEnabled:
+        typeof parsed.backupEnabled === 'boolean'
+          ? parsed.backupEnabled
+          : DEFAULT_CONFIG.backupEnabled,
+      backupCount: ([1, 2, 3, 5, 10] as DisplayConfig['backupCount'][]).includes(
+        parsed.backupCount as DisplayConfig['backupCount'],
+      )
+        ? (parsed.backupCount as DisplayConfig['backupCount'])
+        : DEFAULT_CONFIG.backupCount,
+      verifySave:
+        typeof parsed.verifySave === 'boolean' ? parsed.verifySave : DEFAULT_CONFIG.verifySave,
     };
   } catch {
     return DEFAULT_CONFIG;
@@ -131,6 +145,18 @@ export function useDisplayConfig() {
     setConfig(c => ({ ...c, colHighlight }));
   }, []);
 
+  const setBackupEnabled = useCallback((backupEnabled: boolean) => {
+    setConfig(c => ({ ...c, backupEnabled }));
+  }, []);
+
+  const setBackupCount = useCallback((backupCount: DisplayConfig['backupCount']) => {
+    setConfig(c => ({ ...c, backupCount }));
+  }, []);
+
+  const setVerifySave = useCallback((verifySave: boolean) => {
+    setConfig(c => ({ ...c, verifySave }));
+  }, []);
+
   return {
     config,
     setBytesPerRow,
@@ -145,5 +171,8 @@ export function useDisplayConfig() {
     setByteGrouping,
     setRowHighlight,
     setColHighlight,
+    setBackupEnabled,
+    setBackupCount,
+    setVerifySave,
   };
 }
